@@ -30,6 +30,10 @@ def update_keyspec_from_kwargs(keyspec, keydict) -> KeySpecification:
         "fermi_level_key",
         "external_field_key",
         "polarizability_key",
+        "N_alpha_key",
+        "N_beta_key",
+        "elec_temp_key",
+        "total_charge_key",
     ]
     arrays = [
         "forces_key",
@@ -37,6 +41,7 @@ def update_keyspec_from_kwargs(keyspec, keydict) -> KeySpecification:
         "enegs_key",
         "hardness_key",
         "atomic_multipoles_key",
+        "effective_nuclear_charges_key",
     ]
     info_keys = {}
     arrays_keys = {}
@@ -67,6 +72,10 @@ class ExtAtomicData(AtomicData):
         self,
         **kwargs,
     ):
+        electronic = {
+            key: kwargs.pop(key, None)
+            for key in ("N_alpha", "N_beta", "effective_nuclear_charges")
+        }
         # new bits
         density_coefficients = kwargs.pop("density_coefficients", None)
         density_coefficients_weight = kwargs.pop(
@@ -129,6 +138,7 @@ class ExtAtomicData(AtomicData):
             "enegs": enegs,
             "hardness": hardness,
         }
+        data.update(electronic)
         for key, value in data.items():
             setattr(self, key, value)
 
@@ -140,14 +150,20 @@ class ExtAtomicData(AtomicData):
         cutoff: float,
         heads: Optional[list] = None,
         atomic_multipoles_max_l: int = 0,
+        preserve_cell: bool = False,
     ) -> "ExtAtomicData":
         atomic_data = super().from_config(config, z_table, cutoff, heads=heads)
         num_atoms = len(config.atomic_numbers)
 
-        # redo cell
-        edge_index, shifts, unit_shifts, cell = get_neighborhood(
-            positions=config.positions, cutoff=cutoff, pbc=config.pbc, cell=config.cell
-        )
+        if preserve_cell:
+            # MLDFTB real-space molecules need no artificial electrostatic box.
+            # The parent neighbour list retains the physical periodic shifts.
+            cell = config.cell
+        else:
+            # Legacy electrostatic models require a finite molecular box.
+            edge_index, shifts, unit_shifts, cell = get_neighborhood(
+                positions=config.positions, cutoff=cutoff, pbc=config.pbc, cell=config.cell
+            )
         cell = (
             torch.tensor(cell, dtype=torch.get_default_dtype())
             if cell is not None
@@ -173,7 +189,10 @@ class ExtAtomicData(AtomicData):
                 dtype=torch.get_default_dtype(),
             )
             if config.property_weights.get("atomic_multipoles") is not None
-            else torch.tensor(1.0, dtype=torch.get_default_dtype())
+            else torch.tensor(
+                float(config.properties.get("atomic_multipoles") is not None),
+                dtype=torch.get_default_dtype(),
+            )
         )
         electrostatic_potentials = (
             torch.tensor(config.properties.get("electrostatic_potentials")).unsqueeze(
@@ -300,6 +319,11 @@ class ExtAtomicData(AtomicData):
             polarizability=atomic_data.polarizability,
             polarizability_weight=polarizability_weight,
             elec_temp=atomic_data.elec_temp,  # new things below
+            **{
+                key: torch.as_tensor(config.properties[key], dtype=torch.get_default_dtype())
+                for key in ("N_alpha", "N_beta", "effective_nuclear_charges")
+                if config.properties.get(key) is not None
+            },
             density_coefficients=density_coefficients,
             density_coefficients_weight=density_coefficients_weight,
             electrostatic_potentials=electrostatic_potentials,

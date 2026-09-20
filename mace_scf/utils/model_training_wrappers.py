@@ -34,7 +34,9 @@ def make_model_wrapper(
 ):
     model_class = model.__class__.__name__
 
-    if model_class in ["MACE", "ScaleShiftMACE"]:
+    if model_class == "MLDFTB":
+        return MLDFTBModelWrapper(optimizer=optimizer, output_args=output_args)
+    elif model_class in ["MACE", "ScaleShiftMACE"]:
         return DefaultModelWrapper(
             optimizer=optimizer,
             output_args=output_args,
@@ -522,3 +524,15 @@ class QEqModelWrapper:
                 compute_virials=self.output_args["virials"],
                 compute_stress=self.output_args["stress"],
             )
+
+
+class MLDFTBModelWrapper(DefaultModelWrapper):
+    """Direct non-SCF evaluation, restoring training gradients after validation."""
+
+    def __call__(self, model, batch_dict, training=False, ema=None):
+        if training:
+            # The shared evaluator disables parameter gradients during validation.
+            for group in self.optimizer.param_groups:
+                for parameter in group["params"]:
+                    parameter.requires_grad_(True)
+        return super().__call__(model, batch_dict, training=training, ema=ema)

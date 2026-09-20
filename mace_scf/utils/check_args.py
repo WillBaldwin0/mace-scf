@@ -35,6 +35,38 @@ def check_config_conflicts(args: argparse.Namespace):
             assert "scf_training_options" not in train_stage, f"scf_training_options should not be set for model={args.model}"
             assert "fixed_point_training_options" not in train_stage, f"fixed_point_training_options should not be set for model={args.model}"
 
+    if args.model == "MLDFTB":
+        args.mldftb_config = ast.literal_eval(args.mldftb_config)
+        if not isinstance(args.mldftb_config, dict):
+            raise ValueError("mldftb_config must be a dictionary")
+        keys = next(iter(args.heads.values()))["info_keys"]
+        if not {"N_alpha", "N_beta"}.issubset(keys):
+            raise ValueError("MLDFTB requires N_alpha and N_beta in heads.info_keys")
+        if args.atomic_multipoles_max_l != 1:
+            raise ValueError(
+                "MLDFTB requires atomic_multipoles_max_l=1 (four coefficients)"
+            )
+        unsupported = {
+            "fermi_level",
+            "fermi_level_per_atom",
+            "polarizability",
+            "esps",
+            "field_features",
+            "fermi_level_gradient",
+            "fixedpoint_scf_stability",
+            "final_terms_fixedpoint_scf_stability",
+        }
+        for stage in args.train_schedule:
+            invalid = unsupported.intersection(stage["loss"])
+            if invalid:
+                raise ValueError(
+                    f"MLDFTB does not support these losses: {sorted(invalid)}"
+                )
+        # No polarizability readout is present in the non-SCF model.
+        args.compute_polarizability = False
+        if "pbc_handling" in args.mldftb_config:
+            args.electrostatic_pbc_method = args.mldftb_config["pbc_handling"]
+
     # small things
     if args.field_feature_max_l is None:
         args.field_feature_max_l = args.atomic_multipoles_max_l

@@ -13,7 +13,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from mace.tools import torch_geometric
 from mace.tools.checkpoint import CheckpointHandler, CheckpointState
-from mace.tools.torch_tools import tensor_dict_to_device, to_numpy
+from mace.tools.torch_tools import to_numpy
 from mace.tools.utils import (
     MetricsLogger,
     compute_mae,
@@ -24,6 +24,17 @@ from mace.tools.utils import (
 )
 import os
 from mace.tools.scatter import scatter_sum
+
+
+def _detach_to_cpu(value):
+    """Release evaluation graphs, including nested diagnostic dictionaries."""
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {key: _detach_to_cpu(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return type(value)(_detach_to_cpu(item) for item in value)
+    return value
 
 
 def _should_log_grad_summary(opt_step: int, frequency: Optional[int]) -> bool:
@@ -489,13 +500,8 @@ def evaluate(
             param.requires_grad_(False)
             param.grad = None
 
-        # avoid memory leaks
-        for key in output:
-            if isinstance(output[key], torch.Tensor):
-                output[key] = output[key].detach()
-        
         batch = batch.cpu()
-        output = tensor_dict_to_device(output, device=torch.device("cpu"))
+        output = _detach_to_cpu(output)
 
         loss = loss_fn(pred=output, ref=batch)
         total_loss += to_numpy(loss).item()
@@ -550,11 +556,13 @@ def evaluate(
             output.get("density_coefficients") is not None
             and batch.density_coefficients is not None
         ):
-            dmas_computed = True
-            delta_dmas_list.append(
-                batch.density_coefficients - output["density_coefficients"]
-            )
-            dmas_list.append(batch.density_coefficients)
+            labelled = batch.density_coefficients_weight.reshape(-1)[batch.batch] > 0
+            if bool(labelled.any()):
+                dmas_computed = True
+                delta_dmas_list.append(
+                    batch.density_coefficients[labelled] - output["density_coefficients"][labelled]
+                )
+                dmas_list.append(batch.density_coefficients[labelled])
 
         if (
             output.get("electrostatic_potentials") is not None
@@ -747,15 +755,15 @@ def valid_err_log(
             f"Epoch {epoch}: loss={valid_loss:.4f}, RMSE_E_per_atom={error_e:.1f} meV, RMSE_F={error_f:.1f} meV / A, RMSE_Mu_per_atom={error_mu:.2f} mDebye"
         )
     elif log_errors == "DensityCoefficientsRMSE":
-        error_dma = eval_metrics["rmse_dma"] * 1e3
-        rel_error_dma = eval_metrics["rel_rmse_dma"]
+        error_dma = eval_metrics.get("rmse_dma", float("nan")) * 1e3
+        rel_error_dma = eval_metrics.get("rel_rmse_dma", float("nan"))
         logging.info(
             f"Epoch {epoch}: loss={valid_loss:.4f}, RMSE_DMA={error_dma:.1f} me, rel_RMSE_DMA={rel_error_dma:.2f} %"
         )
     elif log_errors == "DensityEnergyRMSE":
         error_e = eval_metrics["rmse_e_per_atom"] * 1e3
         error_f = eval_metrics["rmse_f"] * 1e3
-        error_dma = eval_metrics["rmse_dma"] * 1e3
+        error_dma = eval_metrics.get("rmse_dma", float("nan")) * 1e3
         logging.info(
             f"Epoch {epoch}: loss={valid_loss:.4f}, RMSE_E_per_atom={error_e:.1f} meV, RMSE_F={error_f:.1f} meV / A, RMSE_DMA={error_dma:.1f} me"
         )
@@ -765,7 +773,7 @@ def valid_err_log(
             f"Epoch {epoch}: loss={valid_loss:.4f}, RMSE_MU_per_atom={error_mu:.6f} meA/atom"
         )
     elif log_errors == "DensityDipoleRMSE":
-        error_dma = eval_metrics["rmse_dma"] * 1e3
+        error_dma = eval_metrics.get("rmse_dma", float("nan")) * 1e3
         error_mu = eval_metrics["rmse_mu_per_atom"] * 1e3
         logging.info(
             f"Epoch {epoch}: loss={valid_loss:.4f}, RMSE_DMA={error_dma:.1f} me, RMSE_MU_per_atom={error_mu:.6f} meA/atom"
@@ -773,7 +781,7 @@ def valid_err_log(
     elif log_errors == "EnergyDensityDipoleRMSE":
         error_e = eval_metrics["rmse_e_per_atom"] * 1e3
         error_f = eval_metrics["rmse_f"] * 1e3
-        error_dma = eval_metrics["rmse_dma"] * 1e3
+        error_dma = eval_metrics.get("rmse_dma", float("nan")) * 1e3
         if not "rmse_mu_per_atom" in eval_metrics:
             error_mu = "NO DIPOLES FOUND VALID SET WHEN LOGGING"
         else:

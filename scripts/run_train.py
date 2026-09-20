@@ -198,27 +198,34 @@ def main() -> None:
         z_table
     )
 
-    # normalization for field feartures
-    args.fermi_level_offset = mace_scf.utils.run_train_utils.get_fermi_level_offset(
-        train_loader,
-        args,
-        device,
-    )
-    logging.info(f"using Fermi level offset {args.fermi_level_offset}")
-    args.field_feature_norms = mace_scf.utils.run_train_utils.get_field_feature_norms(
-        train_loader,
-        args,
-        device,
-        fermi_level_offset=args.fermi_level_offset,
-    )
-    logging.info(f"using normalization for field features {args.field_feature_norms}")
-    args.atom_density_scaling = mace_scf.utils.run_train_utils.get_atom_density_scaling(
-        train_loader,
-        args,
-        device,
-        z_table=z_table,
-    )
-    logging.info(f"using atom density scaling factors {args.atom_density_scaling}")
+    if args.model == "MLDFTB":
+        # Occupations use fixed spin counts; no reference Fermi level or field
+        # normalization is needed by this model.
+        args.fermi_level_offset = 0.0
+        args.field_feature_norms = None
+        args.atom_density_scaling = None
+    else:
+        # normalization for field feartures
+        args.fermi_level_offset = mace_scf.utils.run_train_utils.get_fermi_level_offset(
+            train_loader,
+            args,
+            device,
+        )
+        logging.info(f"using Fermi level offset {args.fermi_level_offset}")
+        args.field_feature_norms = mace_scf.utils.run_train_utils.get_field_feature_norms(
+            train_loader,
+            args,
+            device,
+            fermi_level_offset=args.fermi_level_offset,
+        )
+        logging.info(f"using normalization for field features {args.field_feature_norms}")
+        args.atom_density_scaling = mace_scf.utils.run_train_utils.get_atom_density_scaling(
+            train_loader,
+            args,
+            device,
+            z_table=z_table,
+        )
+        logging.info(f"using atom density scaling factors {args.atom_density_scaling}")
 
     # Build model
     logging.info("Building model")
@@ -331,7 +338,8 @@ def main() -> None:
                     config, 
                     z_table=z_table, 
                     cutoff=args.r_max, 
-                    atomic_multipoles_max_l=args.atomic_multipoles_max_l
+                    atomic_multipoles_max_l=args.atomic_multipoles_max_l,
+                    preserve_cell=args.model == "MLDFTB",
                 )
                 for config in subset
             ]
@@ -433,7 +441,8 @@ def main() -> None:
                     config, 
                     z_table=z_table, 
                     cutoff=args.r_max, 
-                    atomic_multipoles_max_l=args.atomic_multipoles_max_l
+                    atomic_multipoles_max_l=args.atomic_multipoles_max_l,
+                    preserve_cell=args.model == "MLDFTB",
                 )
                 for config in subset
             ]

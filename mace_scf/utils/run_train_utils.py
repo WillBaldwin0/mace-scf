@@ -197,6 +197,34 @@ def build_model(
                 "charge predictions small",
                 fixedpoint_initial_charge_head_scale,
             )
+    elif args.model == "MLDFTB":
+        options = args.mldftb_config
+        if isinstance(options, str):
+            options = ast.literal_eval(options)
+        options = dict(options)
+        charges = options.pop("effective_nuclear_charges", None)
+        if not isinstance(charges, dict):
+            raise ValueError("mldftb_config.effective_nuclear_charges must map atomic numbers to charges")
+        missing = set(z_table.zs) - set(charges)
+        if missing:
+            raise ValueError(f"Missing effective nuclear charges for atomic numbers {sorted(missing)}")
+        allowed = {"n_s", "n_p", "edge_mode", "onsite_mode", "matrix_feature_multiplicity",
+                   "matrix_radial_hidden", "elec_temp_units", "energy_kind", "sigma",
+                   "pp_scalar", "keep_quadrupoles", "coupling_mode", "C", "nuclear_profile",
+                   "nuclear_charge_mode", "self_policy", "pbc_handling", "kspace_cutoff_factor"}
+        unknown = set(options) - allowed
+        if unknown:
+            raise ValueError(f"Unknown mldftb_config options: {sorted(unknown)}; use shared CLI options for MACE features")
+        config = {key: value for key, value in model_config.items() if key != "num_elements"}
+        config.update(sigma=args.atomic_multipoles_smearing_width,
+                      pbc_handling=args.electrostatic_pbc_method,
+                      kspace_cutoff_factor=args.kspace_cutoff_factor)
+        config.update(options)
+        model = electrostatics.MLDFTB(
+            **config, effective_nuclear_charges=[charges[z] for z in z_table.zs],
+            heads=list(args.heads),
+            interaction_cls_first=mace.modules.interaction_classes[args.interaction_first],
+        )
     elif args.model == "MACEQEq":
         with disable_e3nn_codegen():
             model = electrostatics.MACEQEq(
@@ -335,6 +363,30 @@ def get_param_options(model, args):
                 "weight_decay": args.weight_decay,
             }
         )
+    if args.model == "MLDFTB":
+        param_options["params"].append(
+            {
+                "name": "hamiltonian",
+                "params": model.hamiltonian.parameters(),
+                "weight_decay": args.weight_decay,
+            }
+        )
+        # Include any trainable radial embeddings or future density components.
+        for group in param_options["params"]:
+            group["params"] = list(group["params"])
+        assigned = [id(p) for group in param_options["params"] for p in group["params"]]
+        if len(assigned) != len(set(assigned)):
+            raise ValueError("A parameter occurs in multiple MLDFTB optimizer groups")
+        remaining = [p for p in model.parameters() if id(p) not in set(assigned)]
+        if remaining:
+            param_options["params"].append(
+                {
+                    "name": "other",
+                    "params": remaining,
+                    "weight_decay": args.weight_decay,
+                }
+            )
+
     return param_options
 
 

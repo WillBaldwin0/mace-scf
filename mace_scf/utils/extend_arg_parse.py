@@ -273,7 +273,8 @@ def extended_arg_parser() -> argparse.ArgumentParser:
             "FixedPoint",
             "LocalCharges",
             "FixedChargeBaselinedMACE",
-            "MACEQEq" #added model for qeq
+            "MACEQEq",
+            "MLDFTB",
         ],
         type=str,
         default="MACE",
@@ -283,6 +284,11 @@ def extended_arg_parser() -> argparse.ArgumentParser:
         choices=["adam", "adamw", "schedulefree"],
         type=str,
         default="schedulefree",
+    )
+
+    parser.add_argument(
+        "--mldftb_config", default="{}",
+        help="MLDFTB constructor options as a dictionary; effective_nuclear_charges maps atomic numbers to charges.",
     )
 
     # QEq arguments
