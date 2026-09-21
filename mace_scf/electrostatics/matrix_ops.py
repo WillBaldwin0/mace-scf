@@ -348,6 +348,16 @@ def _fill(eps, count, tau, degeneracy_tolerance=1e-9):
                 last = int(target) - 1
                 mu = (eps[last] + eps[last + 1]) / 2
         return f + eps * 0, mu
+    # An integer insulating count has a broad numerical root plateau. Keep
+    # mu in the middle of the gap, away from either occupation edge.
+    if target.is_integer() and 0 < target < n:
+        middle = (eps[int(target) - 1] + eps[int(target)]) / 2
+        trial = torch.sigmoid((middle - eps) / tau)
+        if (
+            float((trial * (1 - trial)).sum().detach())
+            <= 8 * torch.finfo(eps.dtype).eps
+        ):
+            return trial, middle
     # Bisection is only a root finder. Newton corrections restore implicit
     # derivatives of the fixed-count root, including those needed by force loss.
     with torch.no_grad():
@@ -407,138 +417,183 @@ class FermiDiracOccupations(nn.Module):
         return f, mu, entropy
 
 
-def _smooth_density(H, count, tau, tolerance):
-    """Matrix Fermi function without eigenvector derivatives (for force training).
+def _smooth_density(H, count, tau, eps, mu, occupations):
+    """Matrix Fermi density and chemical potential from a saved spectral state.
 
-    Scale the exponent before matrix_exp, then undo scaling by sigmoid doubling.
-    Newton iterations impose the electron count with differentiable operations.
-    This also permits second derivatives at finite-temperature degeneracies.
+    Only used while recording derivatives. Saturated insulating channels keep
+    their gap-midpoint chemical potential but retain subspace rotation.
     """
     eye = torch.eye(H.shape[0], dtype=H.dtype, device=H.device)
     target = float(count.detach())
     if target in (0, H.shape[0]):
-        return H * 0 + eye * (target != 0) + (count + tau) * 0
+        return H * 0 + eye * (target != 0) + (count + tau) * 0, mu
+    precision = torch.finfo(H.dtype).eps
+    count_tol = 128 * precision * H.shape[0]
+    saturated = (
+        target.is_integer()
+        and float((occupations * (1 - occupations)).sum()) <= 8 * precision
+    )
     with torch.no_grad():
-        eps = torch.linalg.eigvalsh(H)
-        _, mu = _fill(eps, count, tau, tolerance)
         bound = float(((eps - mu) / tau).abs().max())
         steps = max(0, int(math.ceil(math.log2(max(bound, 1.0)))))
 
-    def evaluate(mu):
-        exponent = (H - mu * eye) / (tau * 2**steps)
+    def evaluate(chemical_potential):
+        exponent = (H - chemical_potential * eye) / (tau * 2**steps)
         F = torch.linalg.solve(eye + torch.matrix_exp(exponent), eye)
         for _ in range(steps):
             square = F @ F
             complement = eye - F
             F = torch.linalg.solve(square + complement @ complement, square)
             F = (F + F.T) / 2
-        return F
+        return (F + F.T) / 2
 
     for _ in range(3):
         F = evaluate(mu)
-        slope = torch.trace(F - F @ F) / tau
-        # A fully saturated, gapped spectrum has numerically zero count response.
-        if float(slope.detach()) <= torch.finfo(H.dtype).eps:
-            break
-        mu = mu + (count - torch.trace(F)) / slope
-    return evaluate(mu)
-
-
-class _CanonicalDensity(torch.autograd.Function):
-    """Spectral density with the divided-difference derivative at degeneracies.
-
-    Unlike differentiating individual eigenvectors, its first derivative is
-    finite for equal-occupation degenerate states. Finite-temperature higher
-    derivatives use a matrix Fermi function to avoid eigenvector singularities.
-    Zero-temperature higher derivatives require a nondegenerate spectrum.
-    """
-
-    @staticmethod
-    def forward(ctx, H, count, tau, tolerance):
-        eps, U = torch.linalg.eigh(H)
-        f, _ = _fill(eps, count, tau, tolerance)
-        ctx.save_for_backward(H, count, tau)
-        ctx.tolerance = tolerance
-        return (U * f) @ U.T
-
-    @staticmethod
-    def backward(ctx, grad):
-        H, count, tau = ctx.saved_tensors
-        if torch.is_grad_enabled() and float(tau.detach()) > 0:
-            # Keep the original tensors where possible for double backward.
-            inputs = tuple(
-                t if t.requires_grad else t.detach().requires_grad_(True)
-                for t in (H, count, tau)
-            )
-            density = _smooth_density(*inputs, ctx.tolerance)
-            derivatives = torch.autograd.grad(density, inputs, grad, create_graph=True)
-            return *derivatives, None
-        eps, U = torch.linalg.eigh(H)
-        f, _ = _fill(eps, count, tau, ctx.tolerance)
-        G = U.T @ ((grad + grad.T) / 2) @ U
-        gaps = eps[:, None] - eps[None, :]
-        close = gaps.abs() <= ctx.tolerance
-        safe_gaps = torch.where(close, torch.ones_like(gaps), gaps)
-        if float(tau.detach()) > 0:
-            fp = -f * (1 - f) / tau
-        else:
-            fp = torch.zeros_like(f)
-        divided = torch.where(
-            close,
-            (fp[:, None] + fp[None, :]) / 2,
-            (f[:, None] - f[None, :]) / safe_gaps,
+        residual = count - torch.trace(F)
+        susceptibility = torch.trace(F - F @ F)
+        if saturated or float(susceptibility.detach()) <= 8 * precision:
+            if abs(float(residual.detach())) > count_tol:
+                raise RuntimeError(
+                    "Insulating density reconstruction has incorrect electron count"
+                )
+            return F + count * 0, mu
+        mu = mu + residual * tau / susceptibility
+    F = evaluate(mu)
+    if abs(float((count - torch.trace(F)).detach())) > count_tol:
+        raise RuntimeError(
+            "Smooth density chemical-potential corrections did not converge"
         )
-        response = divided * G
-        total = fp.sum()
-        safe_total = torch.where(total != 0, total, torch.ones_like(total))
-        weighted = (fp * G.diagonal()).sum() / safe_total
-        response = response - torch.diag(fp * weighted)
-        grad_H = U @ response @ U.T
-        grad_count = weighted
-        grad_tau = tau * 0
-        if float(tau.detach()) > 0:
-            mean_eps = (fp * eps).sum() / safe_total
-            grad_tau = (G.diagonal() * fp * (mean_eps - eps) / tau).sum()
-        return (grad_H + grad_H.T) / 2, grad_count, grad_tau, None
+    return F, mu
 
 
-class _CanonicalFreeEnergy(torch.autograd.Function):
-    """Canonical band free energy with a spectral-projector gradient."""
+def _spectral_response(U, eps, f, tau, grad, tolerance):
+    """Fixed-count density VJP from cached eigenpairs; no eigensolve."""
+    G = U.T @ ((grad + grad.T) / 2) @ U
+    gaps = eps[:, None] - eps[None, :]
+    close = gaps.abs() <= tolerance
+    safe_gaps = torch.where(close, torch.ones_like(gaps), gaps)
+    fp = -f * (1 - f) / tau if float(tau) > 0 else torch.zeros_like(f)
+    divided = torch.where(
+        close, (fp[:, None] + fp[None, :]) / 2, (f[:, None] - f[None, :]) / safe_gaps
+    )
+    total = fp.sum()
+    safe_total = torch.where(total != 0, total, torch.ones_like(total))
+    weighted = (fp * G.diagonal()).sum() / safe_total
+    response = U @ (divided * G - torch.diag(fp * weighted)) @ U.T
+    width = tau * 0
+    if float(tau) > 0:
+        mean_eps = (fp * eps).sum() / safe_total
+        width = (G.diagonal() * fp * (mean_eps - eps) / tau).sum()
+    return (response + response.T) / 2, weighted, width
+
+
+class _CanonicalState(torch.autograd.Function):
+    """Shared-spin spectral state, with cached first and smooth second derivatives."""
 
     @staticmethod
-    def forward(ctx, H, count, tau, tolerance):
-        eps = torch.linalg.eigvalsh(H)
-        f, mu = _fill(eps, count, tau, tolerance)
-        entropy = eps.sum() * 0
-        if float(tau) > 0 and bool(torch.isfinite(mu)):
-            x = (mu - eps) / tau
-            entropy = (
-                tau
-                * (
+    def forward(ctx, H, counts, tau, tolerance):
+        eps, U = torch.linalg.eigh(H)
+        fs, mus, entropies, densities = [], [], [], []
+        for spin in range(2):
+            if spin and bool(counts[0] == counts[1]):
+                f, mu = fs[0], mus[0]
+            else:
+                f, mu = _fill(eps, counts[spin], tau, tolerance)
+            entropy = tau * 0
+            if float(tau) > 0 and bool(torch.isfinite(mu)):
+                x = (mu - eps) / tau
+                entropy = (
                     f * torch.nn.functional.logsigmoid(x)
                     + (1 - f) * torch.nn.functional.logsigmoid(-x)
                 ).sum()
+            fs.append(f)
+            mus.append(mu)
+            entropies.append(entropy)
+            densities.append(
+                densities[0] if spin and bool(counts[0] == counts[1]) else (U * f) @ U.T
             )
-        ctx.save_for_backward(H, count, tau)
+        f, mu, entropy = torch.stack(fs, -1), torch.stack(mus), torch.stack(entropies)
+        P = torch.stack(densities)
+        free = (f * eps[:, None]).sum() + tau * entropy.sum()
+        ctx.save_for_backward(H, counts, tau, eps, U, f, mu, entropy, P)
         ctx.tolerance = tolerance
-        return (f * eps).sum() + entropy
+        ctx.mark_non_differentiable(eps, f, mu)
+        ctx.set_materialize_grads(False)
+        return P, free, eps, f, mu
 
     @staticmethod
-    def backward(ctx, grad):
-        H, count, tau = ctx.saved_tensors
-        density = _CanonicalDensity.apply(H, count, tau, ctx.tolerance)
-        eps = torch.linalg.eigvalsh(H)
-        f, mu = _fill(eps, count, tau, ctx.tolerance)
-        d_tau = tau * 0
-        if float(tau.detach()) > 0 and bool(torch.isfinite(mu)):
-            x = (mu - eps) / tau
-            d_tau = (
-                f * torch.nn.functional.logsigmoid(x)
-                + (1 - f) * torch.nn.functional.logsigmoid(-x)
-            ).sum()
-        # Counts at the endpoints are fixed, rather than differentiable inputs.
-        d_count = torch.where(torch.isfinite(mu), mu, torch.zeros_like(mu))
-        return grad * density, grad * d_count, grad * d_tau, None
+    def backward(ctx, grad_P, grad_free, *unused):
+        H, counts, tau, eps, U, f, mu, entropy, saved_P = ctx.saved_tensors
+        if grad_P is None:
+            grad_P = H.new_zeros((2,) + H.shape)
+        if grad_free is None:
+            grad_free = H.new_zeros(())
+        if torch.is_grad_enabled():
+            if float(tau.detach()) == 0:
+                raise RuntimeError(
+                    "Force gradients require positive electronic smearing"
+                )
+            inputs = tuple(
+                t if t.requires_grad else t.detach().requires_grad_(True)
+                for t in (H, counts, tau)
+            )
+            h, populations, width = inputs
+            shared = not counts.requires_grad and bool(counts[0] == counts[1])
+            densities, potentials = [], []
+            for spin in range(2):
+                if spin and shared:
+                    density, potential = densities[0], potentials[0]
+                else:
+                    density, potential = _smooth_density(
+                        h, populations[spin], width, eps, mu[spin], f[:, spin]
+                    )
+                densities.append(density)
+                potentials.append(potential)
+            P = torch.stack(densities)
+            dH, dN, dt = torch.autograd.grad(P, inputs, grad_P, create_graph=True)
+            # Entropy value plus its exact local differential, sufficient for
+            # double backward without a matrix logarithm or another eigensolve.
+            ds = []
+            for spin in range(2):
+                if not bool(torch.isfinite(mu[spin])):
+                    ds.append(width * 0)
+                else:
+                    eye = torch.eye(H.shape[0], dtype=H.dtype, device=H.device)
+                    coefficient = ((h - potentials[spin] * eye) / width).detach()
+                    delta = densities[spin] - densities[spin].detach()
+                    ds.append(entropy[spin] - (coefficient * delta).sum())
+            finite_mu = torch.stack(
+                [
+                    potential if bool(torch.isfinite(mu[i])) else populations[i] * 0
+                    for i, potential in enumerate(potentials)
+                ]
+            )
+            return (
+                dH + grad_free * P.sum(0),
+                dN + grad_free * finite_mu,
+                dt + grad_free * torch.stack(ds).sum(),
+                None,
+            )
+        if not counts.requires_grad and bool(counts[0] == counts[1]):
+            response, _, width = _spectral_response(
+                U, eps, f[:, 0], tau, grad_P.sum(0), ctx.tolerance
+            )
+            return (
+                response + grad_free * saved_P.sum(0),
+                None,
+                width + grad_free * entropy.sum(),
+                None,
+            )
+        dH, dN, dt = torch.zeros_like(H), [], tau * 0
+        for spin in range(2):
+            response, population, width = _spectral_response(
+                U, eps, f[:, spin], tau, grad_P[spin], ctx.tolerance
+            )
+            dH = dH + response + grad_free * saved_P[spin]
+            potential = mu[spin] if bool(torch.isfinite(mu[spin])) else mu.new_zeros(())
+            dN.append(population + grad_free * potential)
+            dt = dt + width + grad_free * entropy[spin]
+        return dH, torch.stack(dN), dt, None
 
 
 class ElectronicState(nn.Module):
@@ -563,15 +618,9 @@ class ElectronicState(nn.Module):
         for g, H in enumerate(hamiltonians):
             counts = torch.stack((N_alpha[g], N_beta[g]))
             tau = self.occupations.thermal_energy(elec_temp[g])
-            # Diagnostics and entropy need eigenvalues only, not eigenvector derivatives.
-            eps = torch.linalg.eigvalsh(H)
-            f, mu, entropy = self.occupations(eps, counts, elec_temp[g])
-            densities = [
-                _CanonicalDensity.apply(
-                    H, counts[s], tau, self.occupations.degeneracy_tolerance
-                )
-                for s in range(2)
-            ]
+            densities, free_band, eps, f, mu = _CanonicalState.apply(
+                H, counts, tau, self.occupations.degeneracy_tolerance
+            )
             total, difference = densities[0] + densities[1], densities[0] - densities[1]
             B = self.block_size
             gamma.extend(total[i : i + B, i : i + B] for i in range(0, H.shape[0], B))
@@ -579,15 +628,9 @@ class ElectronicState(nn.Module):
                 difference[i : i + B, i : i + B] for i in range(0, H.shape[0], B)
             )
             bands.append((total * H).sum())
-            free_band = sum(
-                _CanonicalFreeEnergy.apply(
-                    H, counts[s], tau, self.occupations.degeneracy_tolerance
-                )
-                for s in range(2)
-            )
             entropies.append(free_band - bands[-1])
             mus.append(mu)
-            residuals.append(f.sum(0) - counts)
+            residuals.append(f.sum(0) - counts.detach())
             values.append(eps)
             fillings.append(f)
         return dict(

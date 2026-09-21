@@ -253,14 +253,116 @@ def test_reciprocal_boundary_projections(mode):
 
 
 def test_free_energy_degenerate_derivatives():
-    from mace_scf.electrostatics.matrix_ops import _CanonicalFreeEnergy
+    from mace_scf.electrostatics.matrix_ops import _CanonicalState
 
     h = torch.eye(4, requires_grad=True)
 
     def fn(h):
-        return _CanonicalFreeEnergy.apply(
-            (h + h.T) / 2, torch.tensor(1.3), torch.tensor(0.2), 1e-9
-        )
+        return _CanonicalState.apply(
+            (h + h.T) / 2, torch.tensor([1.3, 0.8]), torch.tensor(0.2), 1e-9
+        )[1]
 
     assert torch.autograd.gradcheck(fn, (h,))
     assert torch.autograd.gradgradcheck(fn, (h,))
+
+
+@pytest.mark.parametrize("training", [False, True])
+@pytest.mark.parametrize("counts", [[1.3, 1.3], [1.3, 0.8]])
+def test_shared_spectral_solve(monkeypatch, training, counts):
+    import mace_scf.electrostatics.matrix_ops as ops
+
+    calls = {"eigh": 0, "eigvalsh": 0, "smooth": 0}
+    for name in ("eigh", "eigvalsh"):
+        original = getattr(torch.linalg, name)
+
+        def wrapper(*args, _name=name, _original=original, **kwargs):
+            calls[_name] += 1
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(torch.linalg, name, wrapper)
+    smooth = ops._smooth_density
+
+    def smooth_wrapper(*args):
+        calls["smooth"] += 1
+        return smooth(*args)
+
+    monkeypatch.setattr(ops, "_smooth_density", smooth_wrapper)
+    h = torch.randn(4, 4, requires_grad=True)
+    P, free, *_ = ops._CanonicalState.apply(
+        (h + h.T) / 2, torch.tensor(counts), torch.tensor(0.3), 1e-9
+    )
+    energy = free + (P * torch.randn_like(P)).sum().square()
+    force = torch.autograd.grad(energy, h, create_graph=training)[0]
+    if training:
+        force.square().sum().backward()
+        assert torch.isfinite(h.grad).all()
+    assert calls["eigh"] == 1
+    assert calls["eigvalsh"] == 0
+    if training:
+        assert calls["smooth"] == (1 if counts[0] == counts[1] else 2)
+    else:
+        assert calls["smooth"] == 0
+
+
+@pytest.mark.parametrize("counts", [[2.0, 2.0], [0.0, 4.0]])
+def test_insulating_state_derivatives(counts):
+    from mace_scf.electrostatics.matrix_ops import _CanonicalState
+
+    q, _ = torch.linalg.qr(torch.randn(4, 4))
+    h = (q @ torch.diag(torch.tensor([-3.0, -2.0, 2.0, 3.0])) @ q.T).requires_grad_()
+
+    def fn(h):
+        P, free, *_ = _CanonicalState.apply(
+            (h + h.T) / 2, torch.tensor(counts), torch.tensor(0.01), 1e-9
+        )
+        return P, free
+
+    assert torch.autograd.gradcheck(fn, (h,))
+    assert torch.autograd.gradgradcheck(fn, (h,))
+    if counts[0] == 2:
+        probe = q[:, 0, None] @ q[:, 3, None].T
+        density = fn(h)[0][0]
+        response = torch.autograd.grad((density * probe).sum(), h)[0]
+        assert response.norm() > 0.01
+
+
+def test_canonical_state_count_width_derivatives():
+    from mace_scf.electrostatics.matrix_ops import _CanonicalState
+
+    h = torch.randn(3, 3, requires_grad=True)
+    counts = torch.tensor([1.2, 1.2], requires_grad=True)
+    tau = torch.tensor(0.4, requires_grad=True)
+
+    def fn(h, counts, tau):
+        return _CanonicalState.apply((h + h.T) / 2, counts, tau, 1e-9)[:2]
+
+    assert torch.autograd.gradcheck(fn, (h, counts, tau))
+    assert torch.autograd.gradgradcheck(fn, (h, counts, tau))
+
+
+def test_insulating_reconstruction_rejects_wrong_count():
+    from mace_scf.electrostatics.matrix_ops import _smooth_density
+
+    h = torch.diag(torch.tensor([-3.0, -2.0, 2.0, 3.0]))
+    with pytest.raises(RuntimeError, match="incorrect electron count"):
+        _smooth_density(
+            h,
+            torch.tensor(1.0),
+            torch.tensor(0.01),
+            h.diagonal(),
+            torch.tensor(0.0),
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+        )
+
+
+def test_zero_width_inference_and_force_gradient_error():
+    from mace_scf.electrostatics.matrix_ops import _CanonicalState
+
+    h = torch.diag(torch.tensor([-3.0, -2.0, 2.0, 3.0])).requires_grad_()
+    P, free, *_ = _CanonicalState.apply(
+        h, torch.tensor([2.0, 2.0]), torch.tensor(0.0), 1e-9
+    )
+    gradient = torch.autograd.grad(free + P.square().sum(), h, retain_graph=True)[0]
+    assert torch.isfinite(gradient).all()
+    with pytest.raises(RuntimeError, match="positive electronic smearing"):
+        torch.autograd.grad(free, h, create_graph=True)

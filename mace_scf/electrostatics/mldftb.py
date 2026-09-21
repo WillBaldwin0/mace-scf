@@ -6,8 +6,8 @@ A minimal construction is ``MLDFTB([1, 8], [1., 6.], n_s=1, n_p=1)``;
 pass ``model(batch, training=True)`` when fitting energies and forces. Effective
 nuclear charges are model parameters chosen with the electron counts, not
 necessarily atomic numbers. Use double precision for the electrostatic kernels.
-Periodic Hamiltonians are real Gamma-point matrices. Finite elec_temp is
-recommended for force training; zero-temperature level crossings are not smooth.
+Periodic Hamiltonians are real Gamma-point matrices. Positive elec_temp is
+required for force training; zero-width energies and ordinary forces are supported.
 
 The Hamiltonian is evaluated once; the returned electrostatic potential is
 diagnostic and is not fed back into the electronic state.
