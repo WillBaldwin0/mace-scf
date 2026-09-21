@@ -1,0 +1,1007 @@
+"""Benchmark sparse occupied-space solvers; see ml_dftb/occupied_space_benchmark.md.
+
+Run with: python -m mace_scf.profiling.occupied_space --help
+No force, electrostatic or SCF calculations are performed.
+"""
+
+import argparse
+import csv
+import json
+import math
+import time
+import warnings
+from copy import deepcopy
+from pathlib import Path
+
+import numpy as np
+import torch
+from ase.io import read
+from e3nn import o3
+from mace.data import config_from_atoms
+from mace.tools import torch_geometric
+
+from mace_scf.calculators.mldftb import MLDFTBCalculator
+from mace_scf.data import ExtAtomicData
+from mace_scf.electrostatics.matrix_ops import _fill
+
+
+def synchronize(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def timed(device, function):
+    synchronize(device)
+    start = time.perf_counter()
+    result = function()
+    synchronize(device)
+    return result, 1000 * (time.perf_counter() - start)
+
+
+class BlockHamiltonian:
+    """Symmetric, coalesced atom-pair blocks, including periodic self images.
+
+    Matvecs use either chunked edge gather/bmm/scatter or scalar CSR sparse.mm.
+    Neither backend allocates a dense M x M array. Dense materialisation is an
+    explicit, separately timed operation used only by the reference benchmark.
+    """
+
+    def __init__(self, edge_blocks, edge_index, onsite, edge_chunk=1024):
+        self.n, self.b = onsite.shape[:2]
+        self.size = self.n * self.b
+        self.device, self.dtype = onsite.device, onsite.dtype
+        self.edge_chunk = edge_chunk
+        i, j = edge_index
+        nodes = torch.arange(self.n, device=self.device)
+        keys = torch.cat((i * self.n + j, j * self.n + i, nodes * (self.n + 1)))
+        values = torch.cat(
+            (edge_blocks / 2, edge_blocks.mT / 2, (onsite + onsite.mT) / 2)
+        )
+        unique, inverse = torch.unique(keys, sorted=True, return_inverse=True)
+        self.blocks = onsite.new_zeros(len(unique), self.b, self.b).index_add_(
+            0, inverse, values
+        )
+        self.rows, self.cols = unique // self.n, unique % self.n
+        self.diagonal_blocks = self.blocks[self.rows == self.cols]
+        self.diagonal = self.diagonal_blocks.diagonal(dim1=-2, dim2=-1).reshape(-1)
+        row_sum = onsite.new_zeros(self.n, self.b).index_add_(
+            0, self.rows, self.blocks.abs().sum(-1)
+        )
+        self.lower_bound = (
+            self.diagonal - (row_sum.reshape(-1) - self.diagonal.abs())
+        ).min()
+        self.csr = None
+        self.backend = "edges"
+        self.calls = self.vector_products = 0
+
+    def prepare(self, backend):
+        if backend == "edges":
+            self.csr = None
+        if backend == "csr" and self.csr is None:
+            local = torch.arange(self.b, device=self.device)
+            rows = (self.rows[:, None, None] * self.b + local[None, :, None]).expand(
+                -1, self.b, self.b
+            )
+            cols = (self.cols[:, None, None] * self.b + local[None, None, :]).expand(
+                -1, self.b, self.b
+            )
+            coo = torch.sparse_coo_tensor(
+                torch.stack((rows.flatten(), cols.flatten())),
+                self.blocks.flatten(),
+                (self.size, self.size),
+            ).coalesce()
+            self.csr = coo.to_sparse_csr()
+        self.backend = backend
+
+    def __call__(self, x):
+        if x.shape[1] == 0:
+            return torch.zeros_like(x)
+        self.calls += 1
+        self.vector_products += x.shape[1]
+        if self.backend == "csr":
+            return torch.sparse.mm(self.csr, x)
+        shaped = x.reshape(self.n, self.b, -1)
+        result = torch.zeros_like(shaped)
+        for first in range(0, len(self.blocks), self.edge_chunk):
+            last = first + self.edge_chunk
+            product = torch.bmm(self.blocks[first:last], shaped[self.cols[first:last]])
+            result.index_add_(0, self.rows[first:last], product)
+        return result.reshape(self.size, -1)
+
+    def dense(self):
+        result = self.blocks.new_zeros(self.n, self.n, self.b, self.b)
+        result[self.rows, self.cols] = self.blocks
+        return result.permute(0, 2, 1, 3).reshape(self.size, self.size)
+
+
+def node_features(model, data):
+    """The production MACE feature path, without energy readouts/electrostatics."""
+    attrs, positions, edges = data["node_attrs"], data["positions"], data["edge_index"]
+    shifts = data["shifts"]
+    vectors = positions[edges[1]] - positions[edges[0]] + shifts
+    lengths = vectors.norm(dim=-1, keepdim=True)
+    edge_attrs = model.spherical_harmonics(vectors[:, [1, 2, 0]])
+    radial, _ = model.radial_embedding(lengths, attrs, edges, model.atomic_numbers)
+    features = model.node_embedding(attrs)
+    for interaction, product in zip(model.interactions, model.products):
+        features, sc = interaction(
+            node_attrs=attrs,
+            node_feats=features,
+            edge_attrs=edge_attrs,
+            edge_feats=radial,
+            edge_index=edges,
+        )
+        features = product(node_feats=features, sc=sc, node_attrs=attrs)
+    return features
+
+
+def hamiltonian_blocks(builder, features, positions, edge_index, shifts):
+    """Mirror HamiltonianBuilder up to assembly, avoiding its dense allocation.
+
+    Tests compare these blocks with the production builder for both heads,
+    on-site modes, shortened cutoffs, duplicate image pairs and empty edge sets.
+    """
+    sender, receiver = edge_index
+    vectors = positions[receiver] - positions[sender] + shifts
+    distances = vectors.norm(dim=-1)
+    if bool((distances == 0).any()):
+        raise ValueError("Zero-length Hamiltonian edge")
+    mask = distances < builder.r_max
+    edges = edge_index[:, mask]
+    sender, receiver = edges
+    vectors, distances = vectors[mask], distances[mask]
+    sh = o3.spherical_harmonics(
+        builder.sh_irreps,
+        vectors[:, [1, 2, 0]],
+        normalize=True,
+        normalization="component",
+    )
+    radial = torch.exp(
+        -(((distances[:, None] - builder.radial_centres) / builder.r_max) ** 2)
+    )
+    x = (distances / builder.r_max).clamp(0, 1)
+    envelope = 1 - 10 * x**3 + 15 * x**4 - 6 * x**5
+    if builder.edge_mode == "bilinear":
+        pair = builder.pair_linear(
+            builder.pair_tp(features[sender], features[receiver])
+        )
+    else:
+        pair = (
+            builder.sender_linear(features)[sender]
+            + builder.receiver_linear(features)[receiver]
+        )
+    edge_features = (
+        builder.angular_tp(pair, sh, builder.radial_mlp(radial)) * envelope[:, None]
+    )
+    onsite_features = (
+        builder.onsite_tp(builder.onsite_left(features), builder.onsite_right(features))
+        if builder.onsite_mode == "quadratic"
+        else features
+    )
+    blocks = builder.matrix.edge_readout(edge_features)
+    onsite = builder.matrix.onsite_readout(onsite_features)
+    order = builder.orbital_order
+    return blocks[:, order][:, :, order], edges, onsite[:, order][:, :, order]
+
+
+class Preconditioner:
+    """Diagonal Davidson correction or fixed SPD shifted Jacobi/block Jacobi."""
+
+    def __init__(self, operator, kind):
+        self.op, self.kind = operator, kind
+        guard = max(1e-3, float(operator.diagonal.abs().max()) * 1e-3)
+        self.shift = operator.lower_bound - guard
+        self.cholesky = None
+        if kind == "block":
+            eye = torch.eye(operator.b, device=operator.device, dtype=operator.dtype)
+            self.cholesky = torch.linalg.cholesky(
+                operator.diagonal_blocks - self.shift * eye
+            )
+
+    def __call__(self, residual, eigenvalues, davidson=False):
+        if self.kind == "none":
+            return residual
+        if self.kind == "block":
+            return torch.cholesky_solve(
+                residual.reshape(self.op.n, self.op.b, -1), self.cholesky
+            ).reshape(residual.shape)
+        if davidson:
+            denominator = self.op.diagonal[:, None] - eigenvalues[None, :]
+            floor = max(1e-4, float(self.op.diagonal.abs().max()) * 1e-3)
+            sign = torch.where(
+                denominator < 0,
+                -torch.ones_like(denominator),
+                torch.ones_like(denominator),
+            )
+            return residual / (sign * denominator.abs().clamp_min(floor))
+        return residual / (self.op.diagonal - self.shift)[:, None]
+
+
+def orthogonalize(v, against=None):
+    """Rank-revealing Gram orthogonalisation with reprojection and final QR."""
+    if v.shape[1] == 0:
+        return v
+    if against is not None and against.shape[1]:
+        for _ in range(2):
+            v = v - against @ (against.T @ v)
+    norms = v.norm(dim=0)
+    keep = norms > 10 * torch.finfo(v.dtype).eps
+    v = v[:, keep] / norms[keep]
+    if v.shape[1] == 0:
+        return v
+    gram = v.T @ v
+    values, vectors = torch.linalg.eigh((gram + gram.T) / 2)
+    threshold = max(1e-10, 100 * torch.finfo(v.dtype).eps) * values[-1]
+    keep = values > threshold
+    v = (v @ vectors[:, keep]) / values[keep].sqrt()
+    if against is not None and against.shape[1]:
+        v = v - against @ (against.T @ v)
+    capacity = v.shape[0] - (against.shape[1] if against is not None else 0)
+    return torch.linalg.qr(v[:, :capacity], mode="reduced").Q
+
+
+def initial_space(op, k, guess, seed):
+    generator = torch.Generator(device=op.device).manual_seed(seed)
+    x = (
+        op.blocks.new_empty(op.size, 0)
+        if guess is None
+        else guess[:, :k].to(op.device, op.dtype)
+    )
+    if x.shape[1]:
+        x = torch.linalg.qr(x, mode="reduced").Q
+    if x.shape[1] < k:
+        extra = torch.randn(
+            op.size,
+            k - x.shape[1],
+            device=op.device,
+            dtype=op.dtype,
+            generator=generator,
+        )
+        # Householder QR completes a warm basis reliably even when k reaches
+        # the full matrix dimension; Gram rank thresholds can drop the final
+        # random complement direction in that case.
+        x = torch.linalg.qr(torch.cat((x, extra), dim=1), mode="reduced").Q
+    if x.shape[1] != k:
+        raise RuntimeError("Could not construct requested initial subspace")
+    return x
+
+
+def ritz(v, av, k):
+    projected = v.T @ av
+    values, rotation = torch.linalg.eigh((projected + projected.T) / 2)
+    rotation = rotation[:, :k]
+    return values[:k], v @ rotation, av @ rotation, rotation
+
+
+def davidson(
+    op,
+    k,
+    guess=None,
+    *,
+    tolerance=1e-7,
+    maxiter=100,
+    preconditioner="jacobi",
+    subspace_factor=3,
+    seed=123,
+):
+    """Thick-restarted block Davidson with cached H times the search basis."""
+    precondition = Preconditioner(op, preconditioner)
+    v = initial_space(op, k, guess, seed)
+    av = op(v)
+    capacity = min(op.size, max(k + 1, subspace_factor * k))
+    status = "maxiter"
+    for iteration in range(1, maxiter + 1):
+        values, x, ax, _ = ritz(v, av, k)
+        residual = ax - x * values
+        norms = residual.norm(dim=0)
+        if float(norms.max()) <= tolerance:
+            status = "converged"
+            break
+        active = norms > tolerance
+        directions = precondition(residual[:, active], values[active], davidson=True)
+        if v.shape[1] + directions.shape[1] > capacity:
+            v, av = x, ax
+        w = orthogonalize(directions, v)
+        w = w[:, : capacity - v.shape[1]]
+        if w.shape[1] == 0:
+            status = "stagnated"
+            break
+        v, av = torch.cat((v, w), dim=1), torch.cat((av, op(w)), dim=1)
+    return (
+        values,
+        x,
+        dict(status=status, iterations=iteration, residual_max=float(norms.max())),
+    )
+
+
+def lobpcg(
+    op,
+    k,
+    guess=None,
+    *,
+    tolerance=1e-7,
+    maxiter=100,
+    preconditioner="jacobi",
+    subspace_factor=3,
+    seed=123,
+):
+    """Operator-based block locally optimal preconditioned conjugate gradients.
+
+    Each Rayleigh-Ritz space spans current X, preconditioned residual W and
+    previous search directions P. Rank-deficient directions are removed.
+    This is a benchmark implementation, not a wrapper around torch.lobpcg.
+    """
+    precondition = Preconditioner(op, preconditioner)
+    x = initial_space(op, k, guess, seed)
+    values, x, ax, _ = ritz(x, op(x), k)
+    p = x[:, :0]
+    status = "maxiter"
+    for iteration in range(1, maxiter + 1):
+        residual = ax - x * values
+        norms = residual.norm(dim=0)
+        if float(norms.max()) <= tolerance:
+            status = "converged"
+            break
+        active = norms > tolerance
+        p = orthogonalize(p, x)
+        w = orthogonalize(
+            precondition(residual[:, active], values[active]), torch.cat((x, p), dim=1)
+        )
+        if w.shape[1] + p.shape[1] == 0:
+            status = "stagnated"
+            break
+        v = torch.cat((x, w, p), dim=1)
+        av = torch.cat((ax, op(w), op(p)), dim=1)
+        values, x, ax, rotation = ritz(v, av, k)
+        p = v[:, k:] @ rotation[k:]
+    # Recompute the final residual: the last iteration may have updated X.
+    norms = (ax - x * values).norm(dim=0)
+    if float(norms.max()) <= tolerance:
+        status = "converged"
+    return (
+        values,
+        x,
+        dict(status=status, iterations=iteration, residual_max=float(norms.max())),
+    )
+
+
+def occupations(values, counts, tau, full_size):
+    fillings = torch.stack([_fill(values, count, tau)[0] for count in counts], dim=1)
+    # Conservative bound: all omitted eigenvalues are >= the last retained one.
+    tail = float((full_size - len(values)) * fillings[-1].sum())
+    return fillings, tail
+
+
+def solve_occupied(op, method, counts, tau, empty_states, guess, args):
+    k = min(
+        op.size,
+        max(
+            1,
+            math.ceil(float(counts.max())) + empty_states,
+            guess.shape[1] if guess is not None else 0,
+        ),
+    )
+    iterations = attempts = 0
+    eigensolver_ms = occupation_ms = 0.0
+    while True:
+        (values, vectors, info), elapsed = timed(
+            op.device,
+            lambda: {"davidson": davidson, "lobpcg": lobpcg}[method](
+                op,
+                k,
+                guess,
+                tolerance=args.tolerance,
+                maxiter=args.maxiter,
+                preconditioner=args.preconditioner,
+                subspace_factor=args.subspace_factor,
+                seed=args.seed,
+            ),
+        )
+        eigensolver_ms += elapsed
+        iterations += info["iterations"]
+        attempts += 1
+        (f, tail), elapsed = timed(
+            op.device, lambda: occupations(values, counts, tau, op.size)
+        )
+        occupation_ms += elapsed
+        if (
+            info["status"] != "converged"
+            or tail <= args.tail_tolerance
+            or not args.auto_expand
+            or k == op.size
+        ):
+            break
+        k = min(op.size, k + max(empty_states, k // 4, 8))
+        guess = vectors
+    info.update(
+        k=k,
+        retained_fraction=k / op.size,
+        iterations=iterations,
+        attempts=attempts,
+        tail_bound=tail,
+        occupation_complete=tail <= args.tail_tolerance,
+        eigensolver_ms=eigensolver_ms,
+        occupation_ms=occupation_ms,
+    )
+    return values, vectors, f, info
+
+
+def repeat_configuration(atoms, repeat):
+    multiplier = math.prod(repeat)
+    result = atoms.repeat(repeat) if multiplier != 1 else atoms.copy()
+    result.info = deepcopy(atoms.info)
+    for key in ("N_alpha", "N_beta", "total_charge"):
+        if key not in atoms.info:
+            raise ValueError(f"Missing required atoms.info[{key!r}]")
+        result.info[key] = float(atoms.info[key]) * multiplier
+    if "elec_temp" not in atoms.info:
+        raise ValueError('Missing required atoms.info["elec_temp"]')
+    return result
+
+
+def make_batch(calculator, atoms):
+    config = config_from_atoms(
+        atoms, key_specification=calculator.keyspec, head_name=calculator.head
+    )
+    data = ExtAtomicData.from_config(
+        config,
+        calculator.z_table,
+        float(calculator.model.r_max),
+        heads=calculator.model.heads,
+        atomic_multipoles_max_l=1,
+        preserve_cell=True,
+    )
+    return (
+        next(iter(torch_geometric.dataloader.DataLoader([data], batch_size=1)))
+        .to(calculator.device)
+        .to_dict()
+    )
+
+
+def onsite_density(vectors, f, block_size):
+    local = vectors.reshape(-1, block_size, vectors.shape[1])
+    return torch.einsum("nak,k,nbk->nab", local, f.sum(1), local)
+
+
+def validate(values, vectors, f, reference, block_size, counts, tolerance):
+    """Untimed comparison of invariant observables, not individual eigenvectors."""
+    orthogonality = float(
+        (
+            vectors.T @ vectors
+            - torch.eye(len(values), device=vectors.device, dtype=vectors.dtype)
+        )
+        .abs()
+        .max()
+    )
+    result = dict(
+        orthogonality_max=orthogonality,
+        count_error=float((f.sum(0) - counts).abs().max()),
+    )
+    if reference is not None:
+        e, gamma, band, full_f = reference
+        gamma_approx = onsite_density(vectors, f, block_size).cpu()
+        result.update(
+            eigenvalue_max_error=float((values.cpu() - e[: len(values)]).abs().max()),
+            onsite_density_max_error=float((gamma_approx - gamma).abs().max()),
+            band_energy_error_eV=float((values[:, None] * f).sum().cpu() - band),
+            reference_omitted_electrons=float(full_f[len(values) :].sum()),
+        )
+        result["lowest_verified"] = result["eigenvalue_max_error"] <= max(
+            10 * tolerance,
+            100 * torch.finfo(values.dtype).eps * max(1.0, float(e.abs().max())),
+        )
+    else:
+        result["lowest_verified"] = None
+    return result
+
+
+def parse_repeat(value):
+    try:
+        fields = tuple(int(x) for x in value.lower().replace("x", ",").split(","))
+        if len(fields) == 1:
+            fields = fields * 3
+        if len(fields) != 3 or min(fields) < 1:
+            raise ValueError
+        return fields
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "Use a positive repetition such as 1,1,1 or 2,2,2"
+        ) from exc
+
+
+def plot_timings(rows, output):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+    groups = {}
+    for row in rows:
+        if row.get("status") != "converged" or not row.get("occupation_complete", True):
+            continue
+        if row.get("lowest_verified") is False:
+            continue
+        if row["start"] == "warm" and not row["warm_used"]:
+            continue
+        key = (row["method"], row["backend"], row["start"])
+        groups.setdefault(key, {}).setdefault(row["atoms"], []).append(
+            row["occupied_space_ms"]
+        )
+    for key, points in groups.items():
+        sizes = sorted(points)
+        ax.loglog(
+            sizes, [np.median(points[n]) for n in sizes], "-o", label="/".join(key)
+        )
+    ax.set(
+        xlabel="Atoms",
+        ylabel="Occupied-space time (ms; median across repeats/frames)",
+        title="Occupied-space solves: converged, occupation-complete results only",
+    )
+    ax.grid(alpha=0.2)
+    if groups:
+        ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(output / "timings.png", dpi=180)
+    plt.close(fig)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--xyz", required=True)
+    parser.add_argument(
+        "--frames", default=":", help="ASE frame slice; default all, in file order"
+    )
+    parser.add_argument("--output", type=Path, default=Path("occupied_space_profile"))
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--dtype", choices=["float64", "float32"], default="float64")
+    parser.add_argument("--head")
+    parser.add_argument(
+        "--repeat",
+        action="append",
+        type=parse_repeat,
+        help="Repeatable; default 1,1,1 / 2,1,1 / 2,2,1 / 2,2,2",
+    )
+    parser.add_argument(
+        "--methods",
+        nargs="+",
+        choices=["dense", "davidson", "lobpcg"],
+        default=["dense", "davidson", "lobpcg"],
+    )
+    parser.add_argument(
+        "--backends", nargs="+", choices=["csr", "edges"], default=["csr"]
+    )
+    parser.add_argument(
+        "--starts", nargs="+", choices=["cold", "warm"], default=["cold", "warm"]
+    )
+    parser.add_argument("--empty-states", type=int, default=16)
+    parser.add_argument(
+        "--tail-tolerance",
+        type=float,
+        default=1e-6,
+        help="Bound on total omitted alpha+beta population",
+    )
+    parser.add_argument("--no-auto-expand", dest="auto_expand", action="store_false")
+    parser.add_argument(
+        "--tolerance",
+        type=float,
+        default=1e-7,
+        help="Absolute eigenpair residual tolerance in eV",
+    )
+    parser.add_argument("--maxiter", type=int, default=100)
+    parser.add_argument(
+        "--subspace-factor",
+        type=int,
+        default=3,
+        help="Davidson restart space / requested states",
+    )
+    parser.add_argument(
+        "--preconditioner", choices=["none", "jacobi", "block"], default="jacobi"
+    )
+    parser.add_argument("--edge-chunk", type=int, default=1024)
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=3,
+        help="Timed repetitions, always using the same preceding-frame guess",
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=1,
+        help="Untimed solver repetitions per frame/method/start",
+    )
+    parser.add_argument(
+        "--dense-max-dim",
+        type=int,
+        default=8192,
+        help="Skip dense reference above this dimension",
+    )
+    parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--no-plot", action="store_true")
+    args = parser.parse_args(argv)
+    if (
+        min(
+            args.maxiter,
+            args.repeats,
+            args.edge_chunk,
+            args.threads,
+            args.dense_max_dim,
+        )
+        < 1
+        or args.empty_states < 1
+        or args.warmup < 0
+        or args.subspace_factor < 2
+        or args.tolerance <= 0
+        or args.tail_tolerance <= 0
+    ):
+        parser.error(
+            "Require positive limits/tolerances, empty-states >=1, subspace-factor >=2 and warmup >=0"
+        )
+    if args.device.startswith("cuda") and not torch.cuda.is_available():
+        parser.error(
+            "CUDA is unavailable; use --device cpu for a correctness smoke test"
+        )
+    if not (args.device.startswith("cuda") or args.device == "cpu"):
+        parser.error("This benchmark supports CUDA and CPU")
+    if args.dtype == "float32" and args.tolerance < 1e-5:
+        warnings.warn("float32 may not reach this tolerance; consider --tolerance 1e-4")
+    torch.set_num_threads(args.threads)
+    torch.set_default_dtype(getattr(torch, args.dtype))
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = False
+    calculator = MLDFTBCalculator(
+        model_path=args.model,
+        device=args.device,
+        default_dtype=args.dtype,
+        head=args.head,
+    )
+    device = calculator.device
+    frames = read(args.xyz, index=args.frames)
+    if not isinstance(frames, list):
+        frames = [frames]
+    if not frames:
+        parser.error("No input frames selected")
+    for frame in frames[1:]:
+        if not np.array_equal(frame.numbers, frames[0].numbers):
+            parser.error(
+                "Trajectory warm starts require the same atom count and ordering/species"
+            )
+    repetitions = args.repeat or [(1, 1, 1), (2, 1, 1), (2, 2, 1), (2, 2, 2)]
+    args.output.mkdir(parents=True, exist_ok=True)
+    settings = {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in vars(args).items()
+    }
+    settings.update(
+        torch_version=torch.__version__,
+        cuda_version=torch.version.cuda,
+        gpu=torch.cuda.get_device_name(device) if device.type == "cuda" else None,
+        hamiltonian_cutoff=float(calculator.model.hamiltonian.r_max),
+        mace_cutoff=float(calculator.model.r_max),
+        block_size=calculator.model.hamiltonian.block_size,
+        selected_frames=len(frames),
+        actual_repetitions=repetitions,
+    )
+    (args.output / "settings.json").write_text(json.dumps(settings, indent=2) + "\n")
+    rows = []
+
+    def record(row):
+        rows.append(row)
+        with (args.output / "results.jsonl").open("a") as stream:
+            stream.write(json.dumps(row) + "\n")
+        print(json.dumps(row), flush=True)
+
+    # Fresh run: do not mix timing records from previous invocations.
+    (args.output / "results.jsonl").write_text("")
+    with torch.no_grad():
+        for repeat in repetitions:
+            warm_cache = {}
+            for frame_index, original in enumerate(frames):
+                atoms = repeat_configuration(original, repeat)
+                data, graph_ms = timed(device, lambda: make_batch(calculator, atoms))
+                features, feature_ms = timed(
+                    device, lambda: node_features(calculator.model, data)
+                )
+                (blocks, edges, onsite), block_ms = timed(
+                    device,
+                    lambda: hamiltonian_blocks(
+                        calculator.model.hamiltonian,
+                        features,
+                        data["positions"],
+                        data["edge_index"],
+                        data["shifts"],
+                    ),
+                )
+                op, coalesce_ms = timed(
+                    device,
+                    lambda: BlockHamiltonian(blocks, edges, onsite, args.edge_chunk),
+                )
+                counts = torch.tensor(
+                    [atoms.info["N_alpha"], atoms.info["N_beta"]], device=device
+                )
+                tau = calculator.model.electronic_state.occupations.thermal_energy(
+                    torch.tensor(atoms.info["elec_temp"], device=device)
+                )
+                if (
+                    not bool(torch.isfinite(counts).all())
+                    or bool((counts < 0).any())
+                    or float(counts.max()) > op.size
+                ):
+                    raise ValueError("Invalid spin count for replicated basis")
+                if not bool(torch.isfinite(tau)) or float(tau) < 0:
+                    raise ValueError("Smearing must be finite and nonnegative")
+                nuclei = calculator.model.density_electrostatics.nuclei
+                if nuclei.charge_mode == "per_species":
+                    nuclear_charge = (
+                        data["node_attrs"] @ nuclei.effective_charges
+                    ).sum()
+                else:
+                    nuclear_charge = data["effective_nuclear_charges"].sum()
+                if (
+                    abs(
+                        float(nuclear_charge - counts.sum())
+                        - float(atoms.info["total_charge"])
+                    )
+                    > 1e-5
+                ):
+                    raise ValueError(
+                        "Input electron counts and total charge disagree with model effective nuclei"
+                    )
+                base = dict(
+                    frame=frame_index,
+                    repeat=list(repeat),
+                    atoms=len(atoms),
+                    dimension=op.size,
+                    mace_edges=data["edge_index"].shape[1],
+                    hamiltonian_edges=edges.shape[1],
+                    stored_blocks=len(op.blocks),
+                    scalar_nnz=len(op.blocks) * op.b**2,
+                    block_density=len(op.blocks) / op.n**2,
+                    alpha=float(counts[0]),
+                    beta=float(counts[1]),
+                    tau_eV=float(tau),
+                    graph_ms=graph_ms,
+                    feature_ms=feature_ms,
+                    block_ms=block_ms,
+                    coalesce_ms=coalesce_ms,
+                )
+                del data, features, blocks, edges, onsite
+                reference = None
+                if "dense" in args.methods and op.size <= args.dense_max_dim:
+                    try:
+                        H, assembly_ms = timed(device, op.dense)
+                        for _ in range(args.warmup):
+                            torch.linalg.eigh(H)
+                        times = []
+                        if device.type == "cuda":
+                            torch.cuda.reset_peak_memory_stats(device)
+                        baseline = (
+                            torch.cuda.memory_allocated(device)
+                            if device.type == "cuda"
+                            else 0
+                        )
+                        for sample in range(args.repeats):
+                            e = u = (
+                                None  # Release preceding timing outputs before allocation.
+                            )
+                            (e, u), milliseconds = timed(
+                                device, lambda: torch.linalg.eigh(H)
+                            )
+                            times.append(milliseconds)
+                        peak = (
+                            torch.cuda.max_memory_allocated(device)
+                            if device.type == "cuda"
+                            else 0
+                        )
+                        (f, _), occupation_ms = timed(
+                            device, lambda: occupations(e, counts, tau, op.size)
+                        )
+                        reference = (
+                            e.cpu(),
+                            onsite_density(u, f, op.b).cpu(),
+                            (e[:, None] * f).sum().cpu(),
+                            f.cpu(),
+                        )
+                        record(
+                            dict(
+                                base,
+                                method="dense",
+                                backend="dense",
+                                start="cold",
+                                warm_used=False,
+                                status="converged",
+                                occupation_complete=True,
+                                k=op.size,
+                                retained_fraction=1.0,
+                                iterations=1,
+                                assembly_ms=assembly_ms,
+                                occupation_ms=occupation_ms,
+                                eigensolver_ms=float(np.median(times)),
+                                occupied_space_ms=float(np.median(times))
+                                + occupation_ms,
+                                solve_ms=float(np.median(times)),
+                                solve_times_ms=times,
+                                residual_max=float((H @ u - u * e).norm(dim=0).max()),
+                                peak_cuda_MB=(
+                                    peak / 1e6 if device.type == "cuda" else None
+                                ),
+                                incremental_cuda_MB=(
+                                    (peak - baseline) / 1e6
+                                    if device.type == "cuda"
+                                    else None
+                                ),
+                                **validate(
+                                    e, u, f, reference, op.b, counts, args.tolerance
+                                ),
+                            )
+                        )
+                        del H, e, u, f
+                    except torch.cuda.OutOfMemoryError:
+                        record(
+                            dict(
+                                base,
+                                method="dense",
+                                backend="dense",
+                                start="cold",
+                                warm_used=False,
+                                status="out_of_memory",
+                            )
+                        )
+                        H = e = u = f = None
+                        torch.cuda.empty_cache()
+                elif "dense" in args.methods:
+                    record(
+                        dict(
+                            base,
+                            method="dense",
+                            backend="dense",
+                            start="cold",
+                            warm_used=False,
+                            status="skipped_dimension_limit",
+                        )
+                    )
+                iterative_backends = (
+                    args.backends if any(m != "dense" for m in args.methods) else []
+                )
+                for backend in iterative_backends:
+                    try:
+                        _, setup_ms = timed(device, lambda: op.prepare(backend))
+                    except RuntimeError as error:
+                        record(
+                            dict(
+                                base,
+                                method="operator_setup",
+                                backend=backend,
+                                start="cold",
+                                warm_used=False,
+                                status="failed",
+                                error=str(error),
+                            )
+                        )
+                        op.csr = None
+                        if device.type == "cuda":
+                            torch.cuda.empty_cache()
+                        continue
+                    for method in args.methods:
+                        if method == "dense":
+                            continue
+                        for start in args.starts:
+                            key = (backend, method, start)
+                            guess = warm_cache.get(key) if start == "warm" else None
+                            warm_used = guess is not None
+
+                            def run():
+                                return solve_occupied(
+                                    op,
+                                    method,
+                                    counts,
+                                    tau,
+                                    args.empty_states,
+                                    guess,
+                                    args,
+                                )
+
+                            try:
+                                for _ in range(args.warmup):
+                                    run()
+                                times = []
+                                if device.type == "cuda":
+                                    torch.cuda.reset_peak_memory_stats(device)
+                                baseline = (
+                                    torch.cuda.memory_allocated(device)
+                                    if device.type == "cuda"
+                                    else 0
+                                )
+                                for sample in range(args.repeats):
+                                    e = u = f = None
+                                    op.calls = op.vector_products = 0
+                                    (e, u, f, info), milliseconds = timed(device, run)
+                                    times.append(milliseconds)
+                                peak = (
+                                    torch.cuda.max_memory_allocated(device)
+                                    if device.type == "cuda"
+                                    else 0
+                                )
+                                checks = validate(
+                                    e, u, f, reference, op.b, counts, args.tolerance
+                                )
+                                record(
+                                    dict(
+                                        base,
+                                        method=method,
+                                        backend=backend,
+                                        start=start,
+                                        warm_used=warm_used,
+                                        operator_setup_ms=setup_ms,
+                                        occupied_space_ms=float(np.median(times)),
+                                        solve_ms=float(np.median(times)),
+                                        solve_times_ms=times,
+                                        matvec_calls=op.calls,
+                                        vector_products=op.vector_products,
+                                        peak_cuda_MB=(
+                                            peak / 1e6
+                                            if device.type == "cuda"
+                                            else None
+                                        ),
+                                        incremental_cuda_MB=(
+                                            (peak - baseline) / 1e6
+                                            if device.type == "cuda"
+                                            else None
+                                        ),
+                                        **info,
+                                        **checks,
+                                    )
+                                )
+                                if (
+                                    start == "warm"
+                                    and info["status"] == "converged"
+                                    and info["occupation_complete"]
+                                    and checks["lowest_verified"] is not False
+                                ):
+                                    warm_cache[key] = u.detach()
+                                else:
+                                    warm_cache.pop(key, None)
+                                del e, u, f
+                            except torch.cuda.OutOfMemoryError:
+                                e = u = f = None
+                                warm_cache.pop(key, None)
+                                record(
+                                    dict(
+                                        base,
+                                        method=method,
+                                        backend=backend,
+                                        start=start,
+                                        warm_used=warm_used,
+                                        status="out_of_memory",
+                                    )
+                                )
+                                torch.cuda.empty_cache()
+                            except RuntimeError as error:
+                                e = u = f = None
+                                warm_cache.pop(key, None)
+                                record(
+                                    dict(
+                                        base,
+                                        method=method,
+                                        backend=backend,
+                                        start=start,
+                                        warm_used=warm_used,
+                                        status="failed",
+                                        error=str(error),
+                                    )
+                                )
+                del op, reference
+    fields = sorted({key for row in rows for key in row})
+    with (args.output / "results.csv").open("w") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    if not args.no_plot:
+        plot_timings(rows, args.output)
+
+
+if __name__ == "__main__":
+    main()

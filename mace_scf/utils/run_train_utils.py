@@ -208,7 +208,7 @@ def build_model(
         missing = set(z_table.zs) - set(charges)
         if missing:
             raise ValueError(f"Missing effective nuclear charges for atomic numbers {sorted(missing)}")
-        allowed = {"n_s", "n_p", "edge_mode", "onsite_mode", "matrix_feature_multiplicity",
+        allowed = {"hamiltonian_cutoff", "n_s", "n_p", "edge_mode", "onsite_mode", "matrix_feature_multiplicity",
                    "matrix_radial_hidden", "elec_temp_units", "energy_kind", "sigma",
                    "pp_scalar", "keep_quadrupoles", "coupling_mode", "C", "nuclear_profile",
                    "nuclear_charge_mode", "self_policy", "pbc_handling", "kspace_cutoff_factor"}

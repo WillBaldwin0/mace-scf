@@ -252,6 +252,13 @@ class HamiltonianBuilder(nn.Module):
         if torch.any(vectors.norm(dim=-1) == 0):
             raise ValueError("Zero-length Hamiltonian edges are not allowed")
         distances = vectors.norm(dim=-1)
+        # Reuse the MACE graph, but decode only edges within the Hamiltonian
+        # support. The quintic envelope and its first two derivatives vanish
+        # at this boundary, so removing the other edges preserves smoothness.
+        within = distances < self.r_max
+        edge_index = edge_index[:, within]
+        sender, receiver = edge_index
+        vectors, distances = vectors[within], distances[within]
         sh = o3.spherical_harmonics(
             self.sh_irreps,
             vectors[:, [1, 2, 0]],

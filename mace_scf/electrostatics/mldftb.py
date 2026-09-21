@@ -64,6 +64,7 @@ class MLDFTB(_LocalSourceModelBase):
         self_policy="full",
         pbc_handling="auto",
         kspace_cutoff_factor=1.5,
+        hamiltonian_cutoff=None,
     ):
         super().__init__()
         if energy_kind not in {"internal", "free"}:
@@ -72,6 +73,13 @@ class MLDFTB(_LocalSourceModelBase):
             raise ValueError("At least one interaction is required")
         if len(effective_nuclear_charges) != len(atomic_numbers):
             raise ValueError("Supply one effective nuclear charge per species")
+        hamiltonian_cutoff = (
+            r_max if hamiltonian_cutoff is None else float(hamiltonian_cutoff)
+        )
+        if not np.isfinite(hamiltonian_cutoff) or not 0 < hamiltonian_cutoff <= r_max:
+            raise ValueError(
+                "hamiltonian_cutoff must be positive and no larger than r_max"
+            )
         heads = heads or ["Default"]
         if atomic_energies is None:
             atomic_energies = np.zeros((len(heads), len(atomic_numbers)))
@@ -100,7 +108,7 @@ class MLDFTB(_LocalSourceModelBase):
             n_s,
             n_p,
             edge_mode,
-            r_max,
+            hamiltonian_cutoff,
             num_bessel,
             matrix_feature_multiplicity,
             matrix_radial_hidden,

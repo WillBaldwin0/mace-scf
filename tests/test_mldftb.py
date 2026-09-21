@@ -366,3 +366,60 @@ def test_zero_width_inference_and_force_gradient_error():
     assert torch.isfinite(gradient).all()
     with pytest.raises(RuntimeError, match="positive electronic smearing"):
         torch.autograd.grad(free, h, create_graph=True)
+
+
+@pytest.mark.parametrize("mode", ["bilinear", "linear_endpoints"])
+def test_hamiltonian_cutoff_support_and_smoothness(mode):
+    builder = HamiltonianBuilder("2x0e+2x1o", n_s=1, n_p=1, r_max=2.0, edge_mode=mode)
+    features = torch.randn(2, 8)
+    edges = torch.tensor([[0, 1], [1, 0]])
+
+    def block(distance):
+        positions = torch.stack(
+            (torch.zeros(3), torch.stack((distance, distance * 0, distance * 0)))
+        )
+        return builder(features, positions, edges)[0][:4, 4:]
+
+    assert block(torch.tensor(1.0)).norm() > 0
+    for r in [2.0, 2.1]:
+        assert torch.count_nonzero(block(torch.tensor(r))) == 0
+    norms = []
+    for offset in [1e-3, 1e-4]:
+        r = torch.tensor(2.0 - offset, requires_grad=True)
+        value = block(r).sum()
+        first = torch.autograd.grad(value, r, create_graph=True)[0]
+        second = torch.autograd.grad(first, r)[0]
+        norms.append(torch.stack([value.abs(), first.abs(), second.abs()]))
+    assert torch.all(norms[1] < norms[0] * 0.2)
+    # Periodic shifts, rather than unshifted atom separations, set the mask.
+    positions = torch.tensor([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+    shifts = torch.tensor([[2.0, 0.0, 0.0], [-2.0, 0.0, 0.0]])
+    assert (
+        torch.count_nonzero(builder(features, positions, edges, shifts)[0][:4, 4:]) == 0
+    )
+
+
+@pytest.mark.parametrize("cutoff", [0.0, -1.0, 6.0, float("nan")])
+def test_invalid_hamiltonian_cutoff(cutoff):
+    with pytest.raises(ValueError, match="hamiltonian_cutoff"):
+        MLDFTB([1], [1.0], r_max=5.0, hamiltonian_cutoff=cutoff)
+
+
+def test_short_hamiltonian_cutoff_model_force_training():
+    m = MLDFTB(
+        [1],
+        [1.0],
+        r_max=5.0,
+        hamiltonian_cutoff=0.5,
+        hidden_irreps="2x0e+2x1o",
+        num_interactions=1,
+        elec_temp_units="eV",
+        matrix_feature_multiplicity=2,
+    )
+    assert float(m.r_max) == 5.0
+    assert m.hamiltonian.r_max == 0.5
+    out = m(graph(), training=True)
+    (out["energy"].square().sum() + out["forces"].square().sum()).backward()
+    assert all(
+        torch.isfinite(p.grad).all() for p in m.parameters() if p.grad is not None
+    )
