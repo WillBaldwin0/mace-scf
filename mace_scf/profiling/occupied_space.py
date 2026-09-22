@@ -527,6 +527,13 @@ def parse_repeat(value):
         ) from exc
 
 
+def method_label(row):
+    label = row["method"]
+    if row.get("capped_run"):
+        label += f"[cap={row['iteration_cap']}]"
+    return label
+
+
 def plot_timings(rows, output):
     import matplotlib
 
@@ -542,7 +549,7 @@ def plot_timings(rows, output):
             continue
         if row["start"] == "warm" and not row["warm_used"]:
             continue
-        key = (row["method"], row["backend"], row["start"])
+        key = (method_label(row), row["backend"], row["start"])
         groups.setdefault(key, {}).setdefault(row["atoms"], []).append(
             row["occupied_space_ms"]
         )
@@ -580,9 +587,9 @@ def plot_diagnostics(rows, output, tolerance=1e-7, tail_tolerance=1e-6):
     groups = {}
     for row in rows:
         if "occupied_space_ms" in row:
-            groups.setdefault((row["method"], row["backend"], row["start"]), []).append(
-                row
-            )
+            groups.setdefault(
+                (method_label(row), row["backend"], row["start"]), []
+            ).append(row)
     colors = {
         "dense": "black",
         "davidson": "tab:blue",
@@ -593,7 +600,7 @@ def plot_diagnostics(rows, output, tolerance=1e-7, tail_tolerance=1e-6):
     for (method, backend, start), group in groups.items():
         group.sort(key=lambda r: (r["atoms"], r["frame"]))
         x = [r["atoms"] for r in group]
-        color = colors[method]
+        color = colors[method.split("[")[0]]
         style = "-" if start == "cold" else ":"
         label = f"{method}/{backend}/{start}"
         if start == "warm" and not any(r["warm_used"] for r in group):
@@ -717,7 +724,7 @@ def plot_trajectory(rows, output):
         for row in rows:
             if tuple(row["repeat"]) == case and "occupied_space_ms" in row:
                 groups.setdefault(
-                    (row["method"], row["backend"], row["start"]), []
+                    (method_label(row), row["backend"], row["start"]), []
                 ).append(row)
         for key, group in groups.items():
             group.sort(key=lambda r: r["frame"])
@@ -772,9 +779,9 @@ def plot_observables(rows, output):
     groups = {}
     for row in rows:
         if "electronic_observables_ms" in row:
-            groups.setdefault((row["method"], row["backend"], row["start"]), []).append(
-                row
-            )
+            groups.setdefault(
+                (method_label(row), row["backend"], row["start"]), []
+            ).append(row)
     fields = [
         "electronic_observables_ms",
         "onsite_density_max_error",
@@ -954,6 +961,12 @@ def main(argv=None):
     )
     parser.add_argument("--maxiter", type=int, default=100)
     parser.add_argument(
+        "--iteration-caps",
+        nargs="+",
+        type=int,
+        help="Compare fixed iteration budgets; keep capped warm guesses and disable space expansion",
+    )
+    parser.add_argument(
         "--subspace-factor",
         type=int,
         default=3,
@@ -1007,6 +1020,12 @@ def main(argv=None):
     ):
         parser.error(
             "Require positive limits/tolerances, empty-states >=1, subspace-factor >=2 and warmup >=0"
+        )
+    if args.iteration_caps and (
+        min(args.iteration_caps) < 1 or "dense" not in args.methods
+    ):
+        parser.error(
+            "--iteration-caps requires positive caps and dense in --methods for error measurement"
         )
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         parser.error(
@@ -1144,7 +1163,7 @@ def main(argv=None):
                     and "warm" in args.starts
                     and any(m not in ("dense", "foe") for m in args.methods)
                 )
-                if need_seed and op.size > args.dense_max_dim:
+                if (need_seed or args.iteration_caps) and op.size > args.dense_max_dim:
                     raise ValueError(
                         "Dense warm initialization exceeds --dense-max-dim; increase that limit or use --starts cold"
                     )
@@ -1313,7 +1332,19 @@ def main(argv=None):
                         if device.type == "cuda":
                             torch.cuda.empty_cache()
                         continue
-                    for method in args.methods:
+                    method_caps = [
+                        (m, cap)
+                        for m in args.methods
+                        for cap in (args.iteration_caps or [args.maxiter])
+                        if m not in ("dense", "foe")
+                    ]
+                    if "foe" in args.methods:
+                        method_caps.append(("foe", args.maxiter))
+                    for method, iteration_cap in method_caps:
+                        solver_args = deepcopy(args)
+                        solver_args.maxiter = iteration_cap
+                        if args.iteration_caps:
+                            solver_args.auto_expand = False
                         if method == "dense":
                             continue
                         if method == "foe":
@@ -1322,7 +1353,7 @@ def main(argv=None):
                             )
                             continue
                         for start in args.starts:
-                            key = (backend, method, start)
+                            key = (backend, method, start, iteration_cap)
                             if start == "warm" and frame_index == 0:
                                 if seed_vectors is None:
                                     record(
@@ -1338,7 +1369,13 @@ def main(argv=None):
                                 else:
                                     warm_cache[key] = seed_vectors
                                     record(
-                                        dict(seed_row, method=method, backend=backend)
+                                        dict(
+                                            seed_row,
+                                            method=method,
+                                            backend=backend,
+                                            iteration_cap=iteration_cap,
+                                            capped_run=bool(args.iteration_caps),
+                                        )
                                     )
                                 continue
                             guess = warm_cache.get(key) if start == "warm" else None
@@ -1352,7 +1389,7 @@ def main(argv=None):
                                     tau,
                                     args.empty_states,
                                     guess,
-                                    args,
+                                    solver_args,
                                 )
 
                             try:
@@ -1414,6 +1451,19 @@ def main(argv=None):
                                 checks = validate(
                                     e, u, f, reference, op.b, counts, args.tolerance
                                 )
+                                converged_guess = (
+                                    info["status"] == "converged"
+                                    and info["occupation_complete"]
+                                    and checks["lowest_verified"] is not False
+                                )
+                                reuse_guess = start == "warm" and (
+                                    converged_guess
+                                    or (
+                                        bool(args.iteration_caps)
+                                        and bool(torch.isfinite(u).all())
+                                        and bool(torch.isfinite(e).all())
+                                    )
+                                )
                                 record(
                                     dict(
                                         base,
@@ -1421,6 +1471,10 @@ def main(argv=None):
                                         backend=backend,
                                         start=start,
                                         warm_used=warm_used,
+                                        iteration_cap=iteration_cap,
+                                        capped_run=bool(args.iteration_caps),
+                                        reused_unconverged_guess=reuse_guess
+                                        and not converged_guess,
                                         operator_setup_ms=setup_ms,
                                         density_ms=density_ms,
                                         electronic_observables_ms=float(
@@ -1446,12 +1500,7 @@ def main(argv=None):
                                         **checks,
                                     )
                                 )
-                                if (
-                                    start == "warm"
-                                    and info["status"] == "converged"
-                                    and info["occupation_complete"]
-                                    and checks["lowest_verified"] is not False
-                                ):
+                                if reuse_guess:
                                     warm_cache[key] = u.detach()
                                 else:
                                     warm_cache.pop(key, None)
