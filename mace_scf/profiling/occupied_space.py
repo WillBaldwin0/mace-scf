@@ -1473,7 +1473,7 @@ def main(argv=None):
                                         warm_used=warm_used,
                                         iteration_cap=iteration_cap,
                                         capped_run=bool(args.iteration_caps),
-                                        reused_unconverged_guess=reuse_guess
+                                        retained_unconverged_guess=reuse_guess
                                         and not converged_guess,
                                         operator_setup_ms=setup_ms,
                                         density_ms=density_ms,
