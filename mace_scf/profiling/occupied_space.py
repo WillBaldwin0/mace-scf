@@ -434,6 +434,16 @@ def solve_occupied(op, method, counts, tau, empty_states, guess, args):
     return values, vectors, f, info
 
 
+def dense_warm_seed(values, vectors, counts, tau, args):
+    """Select a population-complete starting space from the first dense solve."""
+    k = min(len(values), max(1, math.ceil(float(counts.max())) + args.empty_states))
+    while True:
+        f, tail = occupations(values[:k], counts, tau, len(values))
+        if tail <= args.tail_tolerance or k == len(values):
+            return values[:k].clone(), vectors[:, :k].clone(), f, tail
+        k = min(len(values), k + max(args.empty_states, k // 4, 8))
+
+
 def repeat_configuration(atoms, repeat):
     multiplier = math.prod(repeat)
     result = atoms.repeat(repeat) if multiplier != 1 else atoms.copy()
@@ -688,6 +698,66 @@ def plot_diagnostics(rows, output, tolerance=1e-7, tail_tolerance=1e-6):
     )
     fig.tight_layout(rect=(0, 0.18, 1, 0.95))
     fig.savefig(output / "diagnostics.png", dpi=180)
+    plt.close(fig)
+
+
+def plot_trajectory(rows, output):
+    """Per-frame costs, separated by system size; dense seeds remain visible."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    cases = sorted({tuple(r["repeat"]) for r in rows if "occupied_space_ms" in r})
+    if not cases:
+        return
+    fig, axes = plt.subplots(len(cases), 1, figsize=(10, 4 * len(cases)), squeeze=False)
+    for ax, case in zip(axes[:, 0], cases):
+        groups = {}
+        for row in rows:
+            if tuple(row["repeat"]) == case and "occupied_space_ms" in row:
+                groups.setdefault(
+                    (row["method"], row["backend"], row["start"]), []
+                ).append(row)
+        for key, group in groups.items():
+            group.sort(key=lambda r: r["frame"])
+            (line,) = ax.plot(
+                [r["frame"] for r in group],
+                [r["occupied_space_ms"] / 1000 for r in group],
+                "--" if key[2] == "warm" else "-",
+                label="/".join(key),
+            )
+            for r in group:
+                ok = (
+                    r["status"] == "converged"
+                    and r.get("occupation_complete", True)
+                    and r.get("lowest_verified") is not False
+                )
+                marker = (
+                    "s" if r.get("initialization") == "dense" else ("o" if ok else "x")
+                )
+                # Hollow circles denote a requested warm run that actually fell back to cold.
+                hollow = key[2] == "warm" and not r.get("warm_used") and marker == "o"
+                ax.plot(
+                    r["frame"],
+                    r["occupied_space_ms"] / 1000,
+                    marker=marker,
+                    color=line.get_color(),
+                    markerfacecolor="none" if hollow else line.get_color(),
+                )
+        ax.set(
+            xlabel="Trajectory frame (selected sequence, zero-based)",
+            ylabel="Solve + occupations (s)",
+            yscale="log",
+            title=f"Replication {case}",
+        )
+        ax.grid(alpha=0.2)
+        ax.legend(fontsize=8)
+    fig.suptitle(
+        "Frame timings: square = dense seed; cross = unresolved; hollow = cold fallback"
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.savefig(output / "trajectory_timings.png", dpi=180)
     plt.close(fig)
 
 
@@ -1068,7 +1138,19 @@ def main(argv=None):
                 )
                 del data, features, blocks, edges, onsite
                 reference = None
-                if "dense" in args.methods and op.size <= args.dense_max_dim:
+                seed_vectors = seed_row = None
+                need_seed = (
+                    frame_index == 0
+                    and "warm" in args.starts
+                    and any(m not in ("dense", "foe") for m in args.methods)
+                )
+                if need_seed and op.size > args.dense_max_dim:
+                    raise ValueError(
+                        "Dense warm initialization exceeds --dense-max-dim; increase that limit or use --starts cold"
+                    )
+                if (
+                    "dense" in args.methods or need_seed
+                ) and op.size <= args.dense_max_dim:
                     try:
                         H, assembly_ms = timed(device, op.dense)
                         for _ in range(args.warmup):
@@ -1112,44 +1194,78 @@ def main(argv=None):
                             f.cpu(),
                             free_band.cpu(),
                         )
-                        record(
-                            dict(
-                                base,
-                                method="dense",
-                                backend="dense",
-                                start="cold",
-                                warm_used=False,
-                                status="converged",
-                                occupation_complete=True,
-                                k=op.size,
-                                retained_fraction=1.0,
-                                iterations=1,
-                                assembly_ms=assembly_ms,
-                                density_ms=density_ms,
-                                electronic_observables_ms=float(np.median(times))
-                                + occupation_ms
-                                + density_ms,
-                                free_band_energy_eV=float(free_band),
-                                occupation_ms=occupation_ms,
-                                eigensolver_ms=float(np.median(times)),
-                                occupied_space_ms=float(np.median(times))
-                                + occupation_ms,
-                                solve_ms=float(np.median(times)),
-                                solve_times_ms=times,
-                                residual_max=float((H @ u - u * e).norm(dim=0).max()),
-                                peak_cuda_MB=(
-                                    peak / 1e6 if device.type == "cuda" else None
-                                ),
-                                incremental_cuda_MB=(
-                                    (peak - baseline) / 1e6
-                                    if device.type == "cuda"
-                                    else None
-                                ),
-                                **validate(
-                                    e, u, f, reference, op.b, counts, args.tolerance
-                                ),
-                            )
+                        dense_row = dict(
+                            base,
+                            method="dense",
+                            backend="dense",
+                            start="cold",
+                            warm_used=False,
+                            status="converged",
+                            occupation_complete=True,
+                            k=op.size,
+                            retained_fraction=1.0,
+                            iterations=1,
+                            assembly_ms=assembly_ms,
+                            density_ms=density_ms,
+                            electronic_observables_ms=float(np.median(times))
+                            + occupation_ms
+                            + density_ms,
+                            free_band_energy_eV=float(free_band),
+                            occupation_ms=occupation_ms,
+                            eigensolver_ms=float(np.median(times)),
+                            occupied_space_ms=float(np.median(times)) + occupation_ms,
+                            solve_ms=float(np.median(times)),
+                            solve_times_ms=times,
+                            residual_max=float((H @ u - u * e).norm(dim=0).max()),
+                            peak_cuda_MB=(
+                                peak / 1e6 if device.type == "cuda" else None
+                            ),
+                            incremental_cuda_MB=(
+                                (peak - baseline) / 1e6
+                                if device.type == "cuda"
+                                else None
+                            ),
+                            **validate(
+                                e, u, f, reference, op.b, counts, args.tolerance
+                            ),
                         )
+                        if "dense" in args.methods:
+                            record(dense_row)
+                        if need_seed:
+                            (seed_values, seed_vectors, seed_f, seed_tail), seed_ms = (
+                                timed(
+                                    device,
+                                    lambda: dense_warm_seed(e, u, counts, tau, args),
+                                )
+                            )
+                            seed_row = dict(dense_row)
+                            seed_row.update(
+                                initialization="dense",
+                                start="warm",
+                                warm_used=False,
+                                seed_selection_ms=seed_ms,
+                                tail_bound=seed_tail,
+                                k=len(seed_values),
+                                retained_fraction=len(seed_values) / op.size,
+                                occupied_space_ms=dense_row["occupied_space_ms"]
+                                + seed_ms,
+                                electronic_observables_ms=dense_row[
+                                    "electronic_observables_ms"
+                                ]
+                                + seed_ms,
+                            )
+                            seed_row.update(
+                                validate(
+                                    seed_values,
+                                    seed_vectors,
+                                    seed_f,
+                                    reference,
+                                    op.b,
+                                    counts,
+                                    args.tolerance,
+                                )
+                            )
+                            del seed_values, seed_f
                         del H, e, u, f, gamma, free_band
                     except torch.cuda.OutOfMemoryError:
                         record(
@@ -1207,6 +1323,24 @@ def main(argv=None):
                             continue
                         for start in args.starts:
                             key = (backend, method, start)
+                            if start == "warm" and frame_index == 0:
+                                if seed_vectors is None:
+                                    record(
+                                        dict(
+                                            base,
+                                            method=method,
+                                            backend=backend,
+                                            start=start,
+                                            warm_used=False,
+                                            status="dense_initialization_failed",
+                                        )
+                                    )
+                                else:
+                                    warm_cache[key] = seed_vectors
+                                    record(
+                                        dict(seed_row, method=method, backend=backend)
+                                    )
+                                continue
                             guess = warm_cache.get(key) if start == "warm" else None
                             warm_used = guess is not None
 
@@ -1350,13 +1484,14 @@ def main(argv=None):
                                         error=str(error),
                                     )
                                 )
-                del op, reference
+                del op, reference, seed_vectors, seed_row
     fields = sorted({key for row in rows for key in row})
     with (args.output / "results.csv").open("w") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
     if not args.no_plot:
+        plot_trajectory(rows, args.output)
         plot_observables(rows, args.output)
         plot_timings(rows, args.output)
         plot_diagnostics(rows, args.output, args.tolerance, args.tail_tolerance)
