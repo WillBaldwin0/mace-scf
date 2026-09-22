@@ -23,6 +23,7 @@ from mace.tools import torch_geometric
 from mace_scf.calculators.mldftb import MLDFTBCalculator
 from mace_scf.data import ExtAtomicData
 from mace_scf.electrostatics.matrix_ops import _fill
+from mace_scf.profiling.polynomial import chebyshev, polynomial_density
 
 
 def synchronize(device):
@@ -386,7 +387,9 @@ def solve_occupied(op, method, counts, tau, empty_states, guess, args):
     while True:
         (values, vectors, info), elapsed = timed(
             op.device,
-            lambda: {"davidson": davidson, "lobpcg": lobpcg}[method](
+            lambda: {"davidson": davidson, "lobpcg": lobpcg, "chebyshev": chebyshev}[
+                method
+            ](
                 op,
                 k,
                 guess,
@@ -395,6 +398,11 @@ def solve_occupied(op, method, counts, tau, empty_states, guess, args):
                 preconditioner=args.preconditioner,
                 subspace_factor=args.subspace_factor,
                 seed=args.seed,
+                **(
+                    dict(degree=args.chebyshev_degree, guard=args.chebyshev_guard)
+                    if method == "chebyshev"
+                    else {}
+                ),
             ),
         )
         eigensolver_ms += elapsed
@@ -478,7 +486,7 @@ def validate(values, vectors, f, reference, block_size, counts, tolerance):
         count_error=float((f.sum(0) - counts).abs().max()),
     )
     if reference is not None:
-        e, gamma, band, full_f = reference
+        e, gamma, band, full_f = reference[:4]
         gamma_approx = onsite_density(vectors, f, block_size).cpu()
         result.update(
             eigenvalue_max_error=float((values.cpu() - e[: len(values)]).abs().max()),
@@ -546,6 +554,281 @@ def plot_timings(rows, output):
     plt.close(fig)
 
 
+def plot_diagnostics(rows, output, tolerance=1e-7, tail_tolerance=1e-6):
+    """Show every timed row, including failures and first-frame warm requests.
+
+    Historical files store only the last repetition's outcome; their timing
+    ranges must not be interpreted as repeated successful solves.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+    groups = {}
+    for row in rows:
+        if "occupied_space_ms" in row:
+            groups.setdefault((row["method"], row["backend"], row["start"]), []).append(
+                row
+            )
+    colors = {
+        "dense": "black",
+        "davidson": "tab:blue",
+        "lobpcg": "tab:orange",
+        "chebyshev": "tab:green",
+        "foe": "tab:purple",
+    }
+    for (method, backend, start), group in groups.items():
+        group.sort(key=lambda r: (r["atoms"], r["frame"]))
+        x = [r["atoms"] for r in group]
+        color = colors[method]
+        style = "-" if start == "cold" else ":"
+        label = f"{method}/{backend}/{start}"
+        if start == "warm" and not any(r["warm_used"] for r in group):
+            label = f"{method}/{backend}/warm requested (actually cold)"
+        y = [r["occupied_space_ms"] / 1000 for r in group]
+        axes[0, 0].plot(x, y, style, color=color, alpha=0.65, label=label)
+        for r, seconds in zip(group, y):
+            accepted = (
+                r["status"] == "converged"
+                and r.get("occupation_complete", True)
+                and r.get("lowest_verified") is not False
+            )
+            # A legacy successful final run with a much shorter median is ambiguous.
+            ambiguous = (
+                "sample_results" not in r
+                and r["method"] != "dense"
+                and accepted
+                and max(r.get("solve_times_ms", [1]))
+                > 1.5 * min(r.get("solve_times_ms", [1]))
+            )
+            marker = "D" if ambiguous else ("o" if accepted else "x")
+            axes[0, 0].scatter(r["atoms"], seconds, marker=marker, color=color, s=55)
+            samples = r.get("solve_times_ms", [])
+            if samples:
+                offset = r.get("occupation_ms", 0) if method == "dense" else 0
+                axes[0, 0].vlines(
+                    r["atoms"],
+                    (min(samples) + offset) / 1000,
+                    (max(samples) + offset) / 1000,
+                    color=color,
+                    alpha=0.45,
+                )
+        if method == "foe":
+            continue  # No eigenpair residual or retained eigenspace for FOE.
+        axes[0, 1].plot(
+            x, [r["k"] / r["dimension"] for r in group], style + "o", color=color
+        )
+        axes[1, 0].plot(
+            x,
+            [max(r.get("residual_max", 0), 1e-17) for r in group],
+            style + "o",
+            color=color,
+        )
+        axes[1, 1].plot(
+            x,
+            [max(r.get("reference_omitted_electrons", 0), 1e-17) for r in group],
+            style + "o",
+            color=color,
+        )
+    axes[0, 0].set(
+        xscale="log",
+        yscale="log",
+        ylabel="Occupied-space time (s)",
+        title="All runs; bars show timing range",
+    )
+    axes[0, 1].set(
+        xscale="log",
+        ylabel="Retained states / full dimension",
+        ylim=(0, 1.05),
+        title="Final repetition: retained fraction",
+    )
+    axes[1, 0].set(
+        xscale="log",
+        yscale="log",
+        ylabel="Maximum eigenpair residual (eV)",
+        title="Final repetition: residual",
+    )
+    axes[1, 1].set(
+        xscale="log",
+        yscale="log",
+        ylabel="Omitted electrons from dense reference",
+        title="Final repetition: occupation truncation",
+    )
+    axes[1, 0].axhline(tolerance, color="0.5", linestyle="--")
+    axes[1, 1].axhline(tail_tolerance, color="0.5", linestyle="--")
+    for ax in axes.flat:
+        ax.set_xlabel("Atoms")
+        ax.grid(alpha=0.2)
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    handles += [
+        Line2D([], [], color="0.3", marker="o", linestyle="", label="Accepted outcome"),
+        Line2D(
+            [],
+            [],
+            color="0.3",
+            marker="x",
+            linestyle="",
+            label="Unconverged/incomplete",
+        ),
+        Line2D(
+            [],
+            [],
+            color="0.3",
+            marker="D",
+            linestyle="",
+            label="Ambiguous historical repeats",
+        ),
+    ]
+    fig.legend(handles=handles, loc="lower center", ncol=2, fontsize=8)
+    fig.suptitle(
+        "Sparse solver diagnostics — failed runs are not equivalent-accuracy timings"
+    )
+    fig.tight_layout(rect=(0, 0.18, 1, 0.95))
+    fig.savefig(output / "diagnostics.png", dpi=180)
+    plt.close(fig)
+
+
+def plot_observables(rows, output):
+    """Compare density-producing costs and errors; keep unresolved runs visible."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+    groups = {}
+    for row in rows:
+        if "electronic_observables_ms" in row:
+            groups.setdefault((row["method"], row["backend"], row["start"]), []).append(
+                row
+            )
+    fields = [
+        "electronic_observables_ms",
+        "onsite_density_max_error",
+        "band_energy_error_eV",
+    ]
+    labels = [
+        "Solve + onsite density (ms)",
+        "Maximum onsite density error",
+        "Absolute band energy error (eV)",
+    ]
+    for key, group in groups.items():
+        group.sort(key=lambda r: (r["atoms"], r["frame"]))
+        for ax, field, label in zip(axes, fields, labels):
+            valid = [r for r in group if field in r]
+            (line,) = ax.plot(
+                [r["atoms"] for r in valid],
+                [max(abs(r[field]), 1e-17) for r in valid],
+                label="/".join(key),
+            )
+            for r in valid:
+                accepted = (
+                    r["status"] == "converged"
+                    and r.get("occupation_complete", True)
+                    and r.get("lowest_verified") is not False
+                )
+                ax.scatter(
+                    r["atoms"],
+                    max(abs(r[field]), 1e-17),
+                    marker="o" if accepted else "x",
+                    color=line.get_color(),
+                )
+    for ax, label in zip(axes, labels):
+        ax.set(xscale="log", yscale="log", xlabel="Atoms", ylabel=label)
+        ax.grid(alpha=0.2)
+    if groups:
+        axes[0].legend(fontsize=7)
+    fig.suptitle("Electronic observables: crosses mark unresolved/incomplete results")
+    fig.tight_layout()
+    fig.savefig(output / "observables.png", dpi=180)
+    plt.close(fig)
+
+
+def benchmark_foe(op, counts, tau, args, base, reference, setup_ms, record):
+    """FOE has no trajectory guess; every timed sample rebuilds its moments."""
+
+    def run():
+        return polynomial_density(
+            op,
+            counts,
+            tau,
+            degree=args.foe_degree,
+            chunk_size=args.foe_chunk_size,
+            tolerance=args.foe_tolerance,
+            count_tolerance=args.tail_tolerance,
+        )
+
+    row = dict(
+        base,
+        method="foe",
+        backend=op.backend,
+        start="cold",
+        warm_used=False,
+        operator_setup_ms=setup_ms,
+    )
+    try:
+        for _ in range(args.warmup):
+            run()
+        baseline = (
+            torch.cuda.memory_allocated(op.device) if op.device.type == "cuda" else 0
+        )
+        if op.device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(op.device)
+        samples, times = [], []
+        for _ in range(args.repeats):
+            op.calls = op.vector_products = 0
+            (gamma, band, info), elapsed = timed(op.device, run)
+            samples.append(
+                dict(
+                    info,
+                    occupied_space_ms=elapsed,
+                    matvec_calls=op.calls,
+                    vector_products=op.vector_products,
+                )
+            )
+            times.append(elapsed)
+        peak = (
+            torch.cuda.max_memory_allocated(op.device)
+            if op.device.type == "cuda"
+            else 0
+        )
+        row.update(info)
+        row["electronic_observables_ms"] = float(np.median(times))
+        if reference is not None and len(reference) > 4:
+            row["free_band_energy_error_eV"] = info["free_band_energy_eV"] - float(
+                reference[4]
+            )
+        row.update(
+            sample_results=samples,
+            solve_times_ms=times,
+            occupied_space_ms=float(np.median(times)),
+            solve_ms=float(np.median(times)),
+            matvec_calls=op.calls,
+            vector_products=op.vector_products,
+            successful_repeats=sum(s["status"] == "converged" for s in samples),
+            peak_cuda_MB=peak / 1e6 if peak else None,
+            incremental_cuda_MB=(peak - baseline) / 1e6 if peak else None,
+        )
+        if len({s["status"] for s in samples}) != 1:
+            row["status"] = "mixed_repeats"
+        row["occupation_complete"] = all(s["occupation_complete"] for s in samples)
+        if reference is not None:
+            row.update(
+                onsite_density_max_error=float(
+                    (gamma.cpu() - reference[1]).abs().max()
+                ),
+                band_energy_error_eV=float(band.cpu() - reference[2]),
+            )
+    except RuntimeError as error:
+        row.update(status="failed", error=str(error))
+        if op.device.type == "cuda":
+            torch.cuda.empty_cache()
+    record(row)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
@@ -566,7 +849,7 @@ def main(argv=None):
     parser.add_argument(
         "--methods",
         nargs="+",
-        choices=["dense", "davidson", "lobpcg"],
+        choices=["dense", "davidson", "lobpcg", "chebyshev", "foe"],
         default=["dense", "davidson", "lobpcg"],
     )
     parser.add_argument(
@@ -574,6 +857,16 @@ def main(argv=None):
     )
     parser.add_argument(
         "--starts", nargs="+", choices=["cold", "warm"], default=["cold", "warm"]
+    )
+    parser.add_argument("--chebyshev-degree", type=int, default=20)
+    parser.add_argument("--chebyshev-guard", type=int, default=16)
+    parser.add_argument("--foe-degree", type=int, default=256)
+    parser.add_argument("--foe-chunk-size", type=int, default=128)
+    parser.add_argument(
+        "--foe-tolerance",
+        type=float,
+        default=1e-8,
+        help="Sampled scalar Fermi-function approximation tolerance",
     )
     parser.add_argument("--empty-states", type=int, default=16)
     parser.add_argument(
@@ -624,6 +917,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if (
         min(
+            args.chebyshev_degree,
+            args.chebyshev_guard,
+            args.foe_degree,
+            args.foe_chunk_size,
             args.maxiter,
             args.repeats,
             args.edge_chunk,
@@ -634,6 +931,7 @@ def main(argv=None):
         or args.empty_states < 1
         or args.warmup < 0
         or args.subspace_factor < 2
+        or args.foe_tolerance <= 0
         or args.tolerance <= 0
         or args.tail_tolerance <= 0
     ):
@@ -799,11 +1097,20 @@ def main(argv=None):
                         (f, _), occupation_ms = timed(
                             device, lambda: occupations(e, counts, tau, op.size)
                         )
+                        gamma, density_ms = timed(
+                            device, lambda: onsite_density(u, f, op.b)
+                        )
+                        entropy_term = (
+                            torch.special.xlogy(f, f)
+                            + torch.special.xlogy(1 - f, 1 - f)
+                        ).sum()
+                        free_band = (e[:, None] * f).sum() + tau * entropy_term
                         reference = (
                             e.cpu(),
-                            onsite_density(u, f, op.b).cpu(),
+                            gamma.cpu(),
                             (e[:, None] * f).sum().cpu(),
                             f.cpu(),
+                            free_band.cpu(),
                         )
                         record(
                             dict(
@@ -818,6 +1125,11 @@ def main(argv=None):
                                 retained_fraction=1.0,
                                 iterations=1,
                                 assembly_ms=assembly_ms,
+                                density_ms=density_ms,
+                                electronic_observables_ms=float(np.median(times))
+                                + occupation_ms
+                                + density_ms,
+                                free_band_energy_eV=float(free_band),
                                 occupation_ms=occupation_ms,
                                 eigensolver_ms=float(np.median(times)),
                                 occupied_space_ms=float(np.median(times))
@@ -838,7 +1150,7 @@ def main(argv=None):
                                 ),
                             )
                         )
-                        del H, e, u, f
+                        del H, e, u, f, gamma, free_band
                     except torch.cuda.OutOfMemoryError:
                         record(
                             dict(
@@ -888,6 +1200,11 @@ def main(argv=None):
                     for method in args.methods:
                         if method == "dense":
                             continue
+                        if method == "foe":
+                            benchmark_foe(
+                                op, counts, tau, args, base, reference, setup_ms, record
+                            )
+                            continue
                         for start in args.starts:
                             key = (backend, method, start)
                             guess = warm_cache.get(key) if start == "warm" else None
@@ -908,6 +1225,7 @@ def main(argv=None):
                                 for _ in range(args.warmup):
                                     run()
                                 times = []
+                                sample_results = []
                                 if device.type == "cuda":
                                     torch.cuda.reset_peak_memory_stats(device)
                                 baseline = (
@@ -920,10 +1238,44 @@ def main(argv=None):
                                     op.calls = op.vector_products = 0
                                     (e, u, f, info), milliseconds = timed(device, run)
                                     times.append(milliseconds)
+                                    sample_results.append(
+                                        dict(
+                                            info,
+                                            occupied_space_ms=milliseconds,
+                                            matvec_calls=op.calls,
+                                            vector_products=op.vector_products,
+                                        )
+                                    )
+                                statuses = {
+                                    sample["status"] for sample in sample_results
+                                }
+                                aggregate = dict(info)
+                                aggregate.update(
+                                    status=(
+                                        info["status"]
+                                        if len(statuses) == 1
+                                        else "mixed_repeats"
+                                    ),
+                                    occupation_complete=all(
+                                        sample["occupation_complete"]
+                                        for sample in sample_results
+                                    ),
+                                    sample_results=sample_results,
+                                    successful_repeats=sum(
+                                        sample["status"] == "converged"
+                                        and sample["occupation_complete"]
+                                        for sample in sample_results
+                                    ),
+                                    k_min=min(sample["k"] for sample in sample_results),
+                                    k_max=max(sample["k"] for sample in sample_results),
+                                )
                                 peak = (
                                     torch.cuda.max_memory_allocated(device)
                                     if device.type == "cuda"
                                     else 0
+                                )
+                                _, density_ms = timed(
+                                    device, lambda: onsite_density(u, f, op.b)
                                 )
                                 checks = validate(
                                     e, u, f, reference, op.b, counts, args.tolerance
@@ -936,6 +1288,11 @@ def main(argv=None):
                                         start=start,
                                         warm_used=warm_used,
                                         operator_setup_ms=setup_ms,
+                                        density_ms=density_ms,
+                                        electronic_observables_ms=float(
+                                            np.median(times)
+                                        )
+                                        + density_ms,
                                         occupied_space_ms=float(np.median(times)),
                                         solve_ms=float(np.median(times)),
                                         solve_times_ms=times,
@@ -951,7 +1308,7 @@ def main(argv=None):
                                             if device.type == "cuda"
                                             else None
                                         ),
-                                        **info,
+                                        **aggregate,
                                         **checks,
                                     )
                                 )
@@ -1000,7 +1357,9 @@ def main(argv=None):
         writer.writeheader()
         writer.writerows(rows)
     if not args.no_plot:
+        plot_observables(rows, args.output)
         plot_timings(rows, args.output)
+        plot_diagnostics(rows, args.output, args.tolerance, args.tail_tolerance)
 
 
 if __name__ == "__main__":
