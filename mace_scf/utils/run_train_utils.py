@@ -197,19 +197,22 @@ def build_model(
                 "charge predictions small",
                 fixedpoint_initial_charge_head_scale,
             )
-    elif args.model == "MLDFTB":
+    elif args.model in {"OneShotMLUKS", "OneShotMLRKS"}:
         options = args.mldftb_config
         if isinstance(options, str):
             options = ast.literal_eval(options)
         options = dict(options)
         charges = options.pop("effective_nuclear_charges", None)
+        if charges is None and options.get("nuclear_charge_mode") == "from_data":
+            charges = {z: 0.0 for z in z_table.zs}
         if not isinstance(charges, dict):
             raise ValueError("mldftb_config.effective_nuclear_charges must map atomic numbers to charges")
         missing = set(z_table.zs) - set(charges)
         if missing:
             raise ValueError(f"Missing effective nuclear charges for atomic numbers {sorted(missing)}")
-        allowed = {"hamiltonian_cutoff", "n_s", "n_p", "edge_mode", "onsite_mode", "matrix_feature_multiplicity",
-                   "matrix_radial_hidden", "elec_temp_units", "energy_kind", "sigma",
+        allowed = {"hamiltonian_cutoff", "n_s", "n_p", "edge_mode", "matrix_sh_max_l", "dos_grid", "dos_width", "matrix_feature_multiplicity",
+                   "matrix_radial_hidden", "default_elec_temp", "elec_temp_units", "energy_kind", "sigma",
+                   "xc_type", "xc_readout", "xc_channels", "xc_hidden", "xc_norm_epsilon",
                    "pp_scalar", "keep_quadrupoles", "coupling_mode", "C", "nuclear_profile",
                    "nuclear_charge_mode", "self_policy", "pbc_handling", "kspace_cutoff_factor"}
         unknown = set(options) - allowed
@@ -220,7 +223,7 @@ def build_model(
                       pbc_handling=args.electrostatic_pbc_method,
                       kspace_cutoff_factor=args.kspace_cutoff_factor)
         config.update(options)
-        model = electrostatics.MLDFTB(
+        model = getattr(electrostatics, args.model)(
             **config, effective_nuclear_charges=[charges[z] for z in z_table.zs],
             heads=list(args.heads),
             interaction_cls_first=mace.modules.interaction_classes[args.interaction_first],
@@ -363,7 +366,7 @@ def get_param_options(model, args):
                 "weight_decay": args.weight_decay,
             }
         )
-    if args.model == "MLDFTB":
+    if args.model in {"OneShotMLUKS", "OneShotMLRKS"}:
         param_options["params"].append(
             {
                 "name": "hamiltonian",
@@ -376,7 +379,7 @@ def get_param_options(model, args):
             group["params"] = list(group["params"])
         assigned = [id(p) for group in param_options["params"] for p in group["params"]]
         if len(assigned) != len(set(assigned)):
-            raise ValueError("A parameter occurs in multiple MLDFTB optimizer groups")
+            raise ValueError("A parameter occurs in multiple one-shot optimizer groups")
         remaining = [p for p in model.parameters() if id(p) not in set(assigned)]
         if remaining:
             param_options["params"].append(

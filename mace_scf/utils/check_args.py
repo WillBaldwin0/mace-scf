@@ -35,16 +35,16 @@ def check_config_conflicts(args: argparse.Namespace):
             assert "scf_training_options" not in train_stage, f"scf_training_options should not be set for model={args.model}"
             assert "fixed_point_training_options" not in train_stage, f"fixed_point_training_options should not be set for model={args.model}"
 
-    if args.model == "MLDFTB":
+    if args.model in {"OneShotMLUKS", "OneShotMLRKS"}:
         args.mldftb_config = ast.literal_eval(args.mldftb_config)
         if not isinstance(args.mldftb_config, dict):
             raise ValueError("mldftb_config must be a dictionary")
         keys = next(iter(args.heads.values()))["info_keys"]
-        if not {"N_alpha", "N_beta"}.issubset(keys):
-            raise ValueError("MLDFTB requires N_alpha and N_beta in heads.info_keys")
+        if not {"N_alpha", "N_beta", "total_charge"}.issubset(keys):
+            raise ValueError("One-shot models require N_alpha, N_beta and total_charge in heads.info_keys")
         if args.atomic_multipoles_max_l != 1:
             raise ValueError(
-                "MLDFTB requires atomic_multipoles_max_l=1 (four coefficients)"
+                "One-shot models require atomic_multipoles_max_l=1 (four coefficients)"
             )
         unsupported = {
             "fermi_level",
@@ -60,7 +60,7 @@ def check_config_conflicts(args: argparse.Namespace):
             invalid = unsupported.intersection(stage["loss"])
             if invalid:
                 raise ValueError(
-                    f"MLDFTB does not support these losses: {sorted(invalid)}"
+                    f"One-shot models do not support these losses: {sorted(invalid)}"
                 )
         # No polarizability readout is present in the non-SCF model.
         args.compute_polarizability = False

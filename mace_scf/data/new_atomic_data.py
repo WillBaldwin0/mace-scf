@@ -41,6 +41,7 @@ def update_keyspec_from_kwargs(keyspec, keydict) -> KeySpecification:
         "enegs_key",
         "hardness_key",
         "atomic_multipoles_key",
+        "atomic_spin_key",
         "effective_nuclear_charges_key",
     ]
     info_keys = {}
@@ -74,7 +75,7 @@ class ExtAtomicData(AtomicData):
     ):
         electronic = {
             key: kwargs.pop(key, None)
-            for key in ("N_alpha", "N_beta", "effective_nuclear_charges")
+            for key in ("N_alpha", "N_beta", "effective_nuclear_charges", "elec_temp_present", "total_charge_present")
         }
         # new bits
         density_coefficients = kwargs.pop("density_coefficients", None)
@@ -318,6 +319,8 @@ class ExtAtomicData(AtomicData):
             charges=atomic_data.charges,
             polarizability=atomic_data.polarizability,
             polarizability_weight=polarizability_weight,
+            elec_temp_present=torch.tensor(config.properties.get("elec_temp") is not None),
+            total_charge_present=torch.tensor(config.properties.get("total_charge") is not None),
             elec_temp=atomic_data.elec_temp,  # new things below
             **{
                 key: torch.as_tensor(config.properties[key], dtype=torch.get_default_dtype())

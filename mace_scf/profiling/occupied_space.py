@@ -140,7 +140,7 @@ def hamiltonian_blocks(builder, features, positions, edge_index, shifts):
     """Mirror HamiltonianBuilder up to assembly, avoiding its dense allocation.
 
     Tests compare these blocks with the production builder for both heads,
-    on-site modes, shortened cutoffs, duplicate image pairs and empty edge sets.
+    on-site heads, shortened cutoffs, duplicate image pairs and empty edge sets.
     """
     sender, receiver = edge_index
     vectors = positions[receiver] - positions[sender] + shifts
@@ -162,7 +162,7 @@ def hamiltonian_blocks(builder, features, positions, edge_index, shifts):
     )
     x = (distances / builder.r_max).clamp(0, 1)
     envelope = 1 - 10 * x**3 + 15 * x**4 - 6 * x**5
-    if builder.edge_mode == "bilinear":
+    if builder.edge_mode == "tensor_product":
         pair = builder.pair_linear(
             builder.pair_tp(features[sender], features[receiver])
         )
@@ -172,17 +172,13 @@ def hamiltonian_blocks(builder, features, positions, edge_index, shifts):
             + builder.receiver_linear(features)[receiver]
         )
     edge_features = (
-        builder.angular_tp(pair, sh, builder.radial_mlp(radial)) * envelope[:, None]
+        builder.angular_mix(builder.angular_tp(pair, sh, builder.radial_mlp(radial))) * envelope[:, None]
     )
-    onsite_features = (
-        builder.onsite_tp(builder.onsite_left(features), builder.onsite_right(features))
-        if builder.onsite_mode == "quadratic"
-        else features
-    )
-    blocks = builder.matrix.edge_readout(edge_features)
-    onsite = builder.matrix.onsite_readout(onsite_features)
+    blocks = builder.edge_readout(edge_features)
+    onsite = builder.onsite_head(features)
     order = builder.orbital_order
-    return blocks[:, order][:, :, order], edges, onsite[:, order][:, :, order]
+    return blocks[:, order][:, :, order], edges, onsite
+
 
 
 class Preconditioner:
@@ -1045,6 +1041,9 @@ def main(argv=None):
         default_dtype=args.dtype,
         head=args.head,
     )
+    if calculator.model.spin_mode != "RKS":
+        raise ValueError("The shared occupied-space benchmark requires OneShotMLRKS")
+
     device = calculator.device
     frames = read(args.xyz, index=args.frames)
     if not isinstance(frames, list):
@@ -1109,7 +1108,7 @@ def main(argv=None):
                 counts = torch.tensor(
                     [atoms.info["N_alpha"], atoms.info["N_beta"]], device=device
                 )
-                tau = calculator.model.electronic_state.occupations.thermal_energy(
+                tau = calculator.model.electronic_state.thermal_energy(
                     torch.tensor(atoms.info["elec_temp"], device=device)
                 )
                 if (

@@ -274,7 +274,8 @@ def extended_arg_parser() -> argparse.ArgumentParser:
             "LocalCharges",
             "FixedChargeBaselinedMACE",
             "MACEQEq",
-            "MLDFTB",
+            "OneShotMLUKS",
+            "OneShotMLRKS",
         ],
         type=str,
         default="MACE",
@@ -288,8 +289,10 @@ def extended_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "--mldftb_config", default="{}",
-        help="MLDFTB constructor options as a dictionary; effective_nuclear_charges maps atomic numbers to charges.",
+        help="One-shot model constructor options as a dictionary; effective_nuclear_charges maps atomic numbers to charges.",
     )
+
+    parser.add_argument("--skip_projected_spin_check", action="store_true", help="Skip only the optional reference projected-spin sum check.")
 
     # QEq arguments
     parser.add_argument(

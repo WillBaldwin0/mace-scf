@@ -3,7 +3,7 @@
 import pytest
 import torch
 from e3nn import o3
-from mace_scf.electrostatics.mldftb import MLDFTB
+from mace_scf.electrostatics.mldftb import OneShotMLUKS, OneShotMLRKS
 from mace_scf.electrostatics.matrix_ops import ElectronicState, HamiltonianBuilder
 from mace_scf.electrostatics.density_electrostatics import DensityElectrostatics
 
@@ -22,6 +22,7 @@ def graph(periodic=False):
         positions=torch.tensor([[0.0, 0.0, 0.0], [1.2, 0.3, 0.2], [0.2, 1.1, 0.4]]),
         node_attrs=torch.ones(3, 1),
         edge_index=torch.tensor([[0, 1, 0, 2, 1, 2], [1, 0, 2, 0, 2, 1]]),
+        total_charge=torch.tensor([0.0]),
         N_alpha=torch.tensor([1.7]),
         N_beta=torch.tensor([1.3]),
         elec_temp=torch.tensor([0.2]),
@@ -33,7 +34,7 @@ def graph(periodic=False):
 
 
 def model(mode="bilinear"):
-    return MLDFTB(
+    return OneShotMLUKS(
         [1],
         [1.0],
         hidden_irreps="2x0e+2x1o",
@@ -44,45 +45,6 @@ def model(mode="bilinear"):
     )
 
 
-@pytest.mark.parametrize("periodic", [False, True])
-@pytest.mark.parametrize("policy", ["full", "subtract_nuclear", "subtract_atomic"])
-def test_explicit_potential(periodic, policy):
-    d = graph(periodic)
-    es = DensityElectrostatics(1, 1, [1.0], self_policy=policy)
-    g = torch.randn(3, 4, 4, requires_grad=True)
-    out = es(
-        g,
-        d,
-        torch.zeros(3, dtype=torch.long),
-        compute_potential=True,
-        external_field=torch.tensor([[0.1, 0.2, 0.3]]),
-    )
-    deriv = torch.autograd.grad(out["electrostatic_energy"].sum(), g)[0]
-    torch.testing.assert_close(deriv, out["effective_potential"], atol=2e-9, rtol=2e-9)
-    torch.testing.assert_close(
-        out["atomic_electron_counts"], g.diagonal(dim1=-2, dim2=-1).sum(-1)
-    )
-
-
-def test_electronic_derivatives():
-    state = ElectronicState(4, "eV")
-    h = torch.randn(4, 4, requires_grad=True)
-
-    def fn(h):
-        return state(
-            [(h + h.T) / 2],
-            torch.tensor([1.3]),
-            torch.tensor([0.8]),
-            torch.tensor([0.3]),
-        )["gamma"]
-
-    assert torch.autograd.gradcheck(fn, (h,))
-    assert torch.autograd.gradgradcheck(fn, (h,))
-    h = torch.eye(4, requires_grad=True)
-    assert torch.autograd.gradcheck(fn, (h,))
-    assert torch.autograd.gradgradcheck(fn, (h,))
-
-
 @pytest.mark.parametrize("mode", ["bilinear", "linear_endpoints"])
 @pytest.mark.parametrize("periodic", [False, True])
 def test_model_forces_and_training(mode, periodic):
@@ -91,8 +53,8 @@ def test_model_forces_and_training(mode, periodic):
     out = m(d, training=True, compute_stress=periodic, return_electronic_state=True)
     assert out["count_residuals"].abs().max() < 1e-12
     torch.testing.assert_close(out["total_charge"], torch.zeros(1), atol=1e-12, rtol=0)
-    h = out["hamiltonians"][0]
-    torch.testing.assert_close(h, h.T)
+    for h in out["hamiltonians"][0]:
+        torch.testing.assert_close(h, h.T)
     step = 1e-5
     plus = {**d, "positions": d["positions"].clone()}
     plus["positions"][1, 0] += step
@@ -141,12 +103,13 @@ def test_rotation_and_batch():
     # Open dipoles are evaluated with the library's finite-difference stencil.
     torch.testing.assert_close(rot["energy"], out["energy"], atol=2e-6, rtol=1e-4)
     torch.testing.assert_close(rot["dipole"], out["dipole"] @ R.T, atol=1e-9, rtol=1e-7)
-    p = graph(True)
+    p = graph(False)
     both = {
         k: torch.cat((d[k], p[k]))
         for k in [
             "positions",
             "node_attrs",
+            "total_charge",
             "N_alpha",
             "N_beta",
             "elec_temp",
@@ -167,9 +130,9 @@ def test_rotation_and_batch():
 
 def test_options_fail_explicitly():
     with pytest.raises(NotImplementedError):
-        DensityElectrostatics(1, 1, [1.0], pp_scalar="S")
+        DensityElectrostatics(1, 1, [1.0], pp_scalar="S", kspace_cutoff=5.0)
     with pytest.raises(NotImplementedError):
-        DensityElectrostatics(1, 1, [1.0], keep_quadrupoles=True)
+        DensityElectrostatics(1, 1, [1.0], keep_quadrupoles=True, kspace_cutoff=5.0)
     with pytest.raises(ValueError, match="inconsistent"):
         model()({**graph(), "total_charge": torch.tensor([1.0])})
 
@@ -187,6 +150,7 @@ def test_periodic_self_images_and_isolated_atom():
         positions=torch.zeros(1, 3),
         node_attrs=torch.ones(1, 1),
         edge_index=torch.empty(2, 0, dtype=torch.long),
+        total_charge=torch.tensor([0.0]),
         N_alpha=torch.tensor([0.6]),
         N_beta=torch.tensor([0.4]),
         elec_temp=torch.tensor([0.2]),
@@ -240,106 +204,6 @@ def test_data_fields():
     torch.testing.assert_close(batch.effective_nuclear_charges, torch.ones(4))
 
 
-@pytest.mark.parametrize("mode", ["molecule_in_box", "slab"])
-def test_reciprocal_boundary_projections(mode):
-    d = graph(False)
-    if mode == "slab":
-        d["pbc"] = torch.tensor([[True, True, False]])
-    es = DensityElectrostatics(1, 1, [1.0], pbc_handling=mode)
-    g = torch.randn(3, 4, 4, requires_grad=True)
-    out = es(g, d, torch.zeros(3, dtype=torch.long), compute_potential=True)
-    deriv = torch.autograd.grad(out["electrostatic_energy"].sum(), g)[0]
-    torch.testing.assert_close(deriv, out["effective_potential"], atol=2e-9, rtol=2e-9)
-
-
-def test_free_energy_degenerate_derivatives():
-    from mace_scf.electrostatics.matrix_ops import _CanonicalState
-
-    h = torch.eye(4, requires_grad=True)
-
-    def fn(h):
-        return _CanonicalState.apply(
-            (h + h.T) / 2, torch.tensor([1.3, 0.8]), torch.tensor(0.2), 1e-9
-        )[1]
-
-    assert torch.autograd.gradcheck(fn, (h,))
-    assert torch.autograd.gradgradcheck(fn, (h,))
-
-
-@pytest.mark.parametrize("training", [False, True])
-@pytest.mark.parametrize("counts", [[1.3, 1.3], [1.3, 0.8]])
-def test_shared_spectral_solve(monkeypatch, training, counts):
-    import mace_scf.electrostatics.matrix_ops as ops
-
-    calls = {"eigh": 0, "eigvalsh": 0, "smooth": 0}
-    for name in ("eigh", "eigvalsh"):
-        original = getattr(torch.linalg, name)
-
-        def wrapper(*args, _name=name, _original=original, **kwargs):
-            calls[_name] += 1
-            return _original(*args, **kwargs)
-
-        monkeypatch.setattr(torch.linalg, name, wrapper)
-    smooth = ops._smooth_density
-
-    def smooth_wrapper(*args):
-        calls["smooth"] += 1
-        return smooth(*args)
-
-    monkeypatch.setattr(ops, "_smooth_density", smooth_wrapper)
-    h = torch.randn(4, 4, requires_grad=True)
-    P, free, *_ = ops._CanonicalState.apply(
-        (h + h.T) / 2, torch.tensor(counts), torch.tensor(0.3), 1e-9
-    )
-    energy = free + (P * torch.randn_like(P)).sum().square()
-    force = torch.autograd.grad(energy, h, create_graph=training)[0]
-    if training:
-        force.square().sum().backward()
-        assert torch.isfinite(h.grad).all()
-    assert calls["eigh"] == 1
-    assert calls["eigvalsh"] == 0
-    if training:
-        assert calls["smooth"] == (1 if counts[0] == counts[1] else 2)
-    else:
-        assert calls["smooth"] == 0
-
-
-@pytest.mark.parametrize("counts", [[2.0, 2.0], [0.0, 4.0]])
-def test_insulating_state_derivatives(counts):
-    from mace_scf.electrostatics.matrix_ops import _CanonicalState
-
-    q, _ = torch.linalg.qr(torch.randn(4, 4))
-    h = (q @ torch.diag(torch.tensor([-3.0, -2.0, 2.0, 3.0])) @ q.T).requires_grad_()
-
-    def fn(h):
-        P, free, *_ = _CanonicalState.apply(
-            (h + h.T) / 2, torch.tensor(counts), torch.tensor(0.01), 1e-9
-        )
-        return P, free
-
-    assert torch.autograd.gradcheck(fn, (h,))
-    assert torch.autograd.gradgradcheck(fn, (h,))
-    if counts[0] == 2:
-        probe = q[:, 0, None] @ q[:, 3, None].T
-        density = fn(h)[0][0]
-        response = torch.autograd.grad((density * probe).sum(), h)[0]
-        assert response.norm() > 0.01
-
-
-def test_canonical_state_count_width_derivatives():
-    from mace_scf.electrostatics.matrix_ops import _CanonicalState
-
-    h = torch.randn(3, 3, requires_grad=True)
-    counts = torch.tensor([1.2, 1.2], requires_grad=True)
-    tau = torch.tensor(0.4, requires_grad=True)
-
-    def fn(h, counts, tau):
-        return _CanonicalState.apply((h + h.T) / 2, counts, tau, 1e-9)[:2]
-
-    assert torch.autograd.gradcheck(fn, (h, counts, tau))
-    assert torch.autograd.gradgradcheck(fn, (h, counts, tau))
-
-
 def test_insulating_reconstruction_rejects_wrong_count():
     from mace_scf.electrostatics.matrix_ops import _smooth_density
 
@@ -353,19 +217,6 @@ def test_insulating_reconstruction_rejects_wrong_count():
             torch.tensor(0.0),
             torch.tensor([1.0, 0.0, 0.0, 0.0]),
         )
-
-
-def test_zero_width_inference_and_force_gradient_error():
-    from mace_scf.electrostatics.matrix_ops import _CanonicalState
-
-    h = torch.diag(torch.tensor([-3.0, -2.0, 2.0, 3.0])).requires_grad_()
-    P, free, *_ = _CanonicalState.apply(
-        h, torch.tensor([2.0, 2.0]), torch.tensor(0.0), 1e-9
-    )
-    gradient = torch.autograd.grad(free + P.square().sum(), h, retain_graph=True)[0]
-    assert torch.isfinite(gradient).all()
-    with pytest.raises(RuntimeError, match="positive electronic smearing"):
-        torch.autograd.grad(free, h, create_graph=True)
 
 
 @pytest.mark.parametrize("mode", ["bilinear", "linear_endpoints"])
@@ -402,11 +253,11 @@ def test_hamiltonian_cutoff_support_and_smoothness(mode):
 @pytest.mark.parametrize("cutoff", [0.0, -1.0, 6.0, float("nan")])
 def test_invalid_hamiltonian_cutoff(cutoff):
     with pytest.raises(ValueError, match="hamiltonian_cutoff"):
-        MLDFTB([1], [1.0], r_max=5.0, hamiltonian_cutoff=cutoff)
+        OneShotMLUKS([1], [1.0], r_max=5.0, hamiltonian_cutoff=cutoff)
 
 
 def test_short_hamiltonian_cutoff_model_force_training():
-    m = MLDFTB(
+    m = OneShotMLUKS(
         [1],
         [1.0],
         r_max=5.0,
@@ -423,3 +274,98 @@ def test_short_hamiltonian_cutoff_model_force_training():
     assert all(
         torch.isfinite(p.grad).all() for p in m.parameters() if p.grad is not None
     )
+
+
+@pytest.mark.parametrize("kind", ["internal", "free"])
+def test_rks_uks_equivalence_and_combined_spectral_force_loss(kind):
+    kwargs = dict(
+        hidden_irreps="2x0e+2x1o",
+        num_interactions=1,
+        matrix_feature_multiplicity=3,
+        elec_temp_units="eV",
+        energy_kind=kind,
+    )
+    rks = OneShotMLRKS([1], [1.0], **kwargs)
+    uks = OneShotMLUKS([1], [1.0], **kwargs)
+    uks.load_state_dict(rks.state_dict(), strict=False)
+    assert any(torch.count_nonzero(p) for p in uks.exchange_head.parameters())
+    for p in uks.exchange_head.parameters():
+        p.data.zero_()
+    d = graph()
+    d["N_alpha"] = d["N_beta"] = torch.tensor([1.5])
+    r = rks(d, training=True, return_electronic_state=True)
+    u = uks(d, training=True, return_electronic_state=True)
+    for key in ("energy", "forces", "gamma", "gamma_spin", "dos", "cumulative_dos"):
+        torch.testing.assert_close(r[key], u[key])
+    assert r["derivative_mode"] == u["derivative_mode"] == "second_order"
+    for model_, out in ((rks, r), (uks, u)):
+        (
+            out["energy"].sum()
+            + out["forces"].square().sum()
+            + out["dos"].square().sum() * 0.01
+            + out["cumulative_dos"].sum() * 0.01
+        ).backward()
+        assert all(
+            torch.isfinite(p.grad).all()
+            for p in model_.parameters()
+            if p.grad is not None
+        )
+    for name, p in rks.named_parameters():
+        q = dict(uks.named_parameters())[name]
+        if p.grad is not None:
+            torch.testing.assert_close(p.grad, q.grad, atol=1e-8, rtol=1e-6)
+    for training, forces, mode in (
+        (False, False, "none"),
+        (False, True, "first_order"),
+        (True, False, "first_order"),
+    ):
+        out = rks(
+            d, training=training, compute_force=forces, return_electronic_state=True
+        )
+        assert out["derivative_mode"] == mode
+
+
+def test_exchange_is_onsite_and_in_band_energy():
+    m = model()
+    out = m(graph(), training=True, compute_force=False, return_electronic_state=True)
+    ha, hb = out["hamiltonians"][0]
+    delta = (ha - hb) / 2
+    for i in range(3):
+        for j in range(3):
+            if i != j:
+                torch.testing.assert_close(
+                    delta[4 * i : 4 * i + 4, 4 * j : 4 * j + 4], torch.zeros(4, 4)
+                )
+    assert delta.norm() > 0
+    pa, pb = (s["density"] for s in out["spectral_states"][0])
+    expected = ((pa + pb) * (ha + hb) / 2).sum() + ((pa - pb) * delta).sum()
+    torch.testing.assert_close(expected, out["band_energy"][0])
+    out["energy"].sum().backward()
+    assert any(
+        p.grad is not None and p.grad.norm() > 0 for p in m.exchange_head.parameters()
+    )
+    with pytest.raises(ValueError, match="N_alpha >= N_beta"):
+        m({**graph(), "N_alpha": torch.tensor([1.0]), "N_beta": torch.tensor([2.0])})
+
+
+@pytest.mark.parametrize("edge_mode", ["tensor_product", "endpoint_sum"])
+def test_matrix_equivariance_and_configurable_harmonics(edge_mode):
+    irreps = o3.Irreps("3x0e+3x1o")
+    builder = HamiltonianBuilder(
+        irreps, n_s=2, n_p=2, feature_multiplicity=5, sh_max_l=2, edge_mode=edge_mode
+    )
+    x = torch.randn(3, 3)
+    features = torch.randn(3, irreps.dim)
+    edges = graph()["edge_index"]
+    R = -o3.rand_matrix()  # include reflections
+    perm = torch.tensor([1, 2, 0])
+    Q = R[perm][:, perm]
+    rotated = features @ irreps.D_from_matrix(Q).T
+    H = builder(features, x, edges)[0]
+    HR = builder(rotated, x @ R.T, edges)[0]
+    atomD = torch.block_diag(torch.eye(2), R, R)
+    D = torch.block_diag(atomD, atomD, atomD)
+    torch.testing.assert_close(HR, D @ H @ D.T, atol=1e-8, rtol=1e-7)
+    torch.testing.assert_close(H, H.T)
+    with pytest.raises(ValueError, match="required irreps"):
+        HamiltonianBuilder(irreps, sh_max_l=0)

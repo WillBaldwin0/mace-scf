@@ -198,7 +198,7 @@ def main() -> None:
         z_table
     )
 
-    if args.model == "MLDFTB":
+    if args.model in {"OneShotMLUKS", "OneShotMLRKS"}:
         # Occupations use fixed spin counts; no reference Fermi level or field
         # normalization is needed by this model.
         args.fermi_level_offset = 0.0
@@ -339,7 +339,7 @@ def main() -> None:
                     z_table=z_table, 
                     cutoff=args.r_max, 
                     atomic_multipoles_max_l=args.atomic_multipoles_max_l,
-                    preserve_cell=args.model == "MLDFTB",
+                    preserve_cell=args.model in {"OneShotMLUKS", "OneShotMLRKS"},
                 )
                 for config in subset
             ]
@@ -442,7 +442,7 @@ def main() -> None:
                     z_table=z_table, 
                     cutoff=args.r_max, 
                     atomic_multipoles_max_l=args.atomic_multipoles_max_l,
-                    preserve_cell=args.model == "MLDFTB",
+                    preserve_cell=args.model in {"OneShotMLUKS", "OneShotMLRKS"},
                 )
                 for config in subset
             ]

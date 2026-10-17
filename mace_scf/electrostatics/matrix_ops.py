@@ -1,7 +1,6 @@
 """Equivariant s/p Hamiltonians and fixed-population electronic states."""
 
 import math
-from typing import Optional
 
 import torch
 from e3nn import o3
@@ -65,8 +64,12 @@ class SPBlockReadout(nn.Module):
         if features.ndim != 2 or features.shape[-1] != self.feature_irreps.dim:
             raise ValueError("Expected [items, feature_irreps.dim] features")
         count = features.shape[0]
+        return self.decode(self.readout(features))
+
+    def decode(self, x):
+        """Decode coefficients in the fixed S,T,V,W,Z,Q order."""
+        count = x.shape[0]
         ns, np = self.n_s, self.n_p
-        x = self.readout(features)  # [items, B**2], flattened irrep layout
         S, T, V, W, Z, Q = torch.split(x, self.split_sizes, dim=-1)
 
         S = S.reshape(count, ns, ns)
@@ -89,11 +92,251 @@ class SPBlockReadout(nn.Module):
         return torch.cat((top, bottom), dim=-2)
 
 
+def _xc_readout(size, readout, hidden_features):
+    if readout == "linear":
+        return nn.Linear(size, 1)
+    if readout == "nonlinear":
+        if not isinstance(hidden_features, int) or hidden_features < 1:
+            raise ValueError("XC hidden_features must be a positive integer")
+        return nn.Sequential(
+            nn.Linear(size, hidden_features), nn.SiLU(), nn.Linear(hidden_features, 1)
+        )
+    raise ValueError("XC readout must be linear or nonlinear")
+
+
+class _DensityBlockIrreps(nn.Module):
+    """Fixed Cartesian s/p matrix decomposition into MACE-frame irreps."""
+
+    def __init__(self, n_s, n_p):
+        super().__init__()
+        if min(n_s, n_p) < 0 or n_s + n_p == 0:
+            raise ValueError("Require a nonempty s/p basis")
+        self.n_s, self.n_p = n_s, n_p
+        self.block_size = n_s + 3 * n_p
+        self.irreps = o3.Irreps(
+            [
+                (m, ir)
+                for m, ir in (
+                    (n_s * n_s + n_p * n_p, "0e"),
+                    (2 * n_s * n_p, "1o"),
+                    (n_p * n_p, "1e"),
+                    (n_p * n_p, "2e"),
+                )
+                if m
+            ]
+        )
+        self.register_buffer("to_feature_order", _orbital_order(n_s, n_p).argsort())
+        self.register_buffer("quadrupole_basis", 5**0.5 * o3.wigner_3j(2, 1, 1))
+        epsilon = torch.zeros(3, 3, 3)
+        epsilon[0, 1, 2] = epsilon[1, 2, 0] = epsilon[2, 0, 1] = 1
+        epsilon[0, 2, 1] = epsilon[2, 1, 0] = epsilon[1, 0, 2] = -1
+        self.register_buffer("axial_basis", epsilon / math.sqrt(2))
+
+    def forward(self, density):
+        if density.ndim != 3 or density.shape[1:] != (self.block_size, self.block_size):
+            raise ValueError("Expected on-site density blocks [N,B,B]")
+        density = (density + density.transpose(-1, -2)) / 2
+        density = density.index_select(1, self.to_feature_order).index_select(
+            2, self.to_feature_order
+        )
+        n, s, p = density.shape[0], self.n_s, self.n_p
+        pp = density[:, s:, s:].reshape(n, p, 3, p, 3)
+        scalar = torch.cat(
+            (
+                density[:, :s, :s].reshape(n, s * s),
+                torch.einsum("nuava->nuv", pp).reshape(n, p * p) / math.sqrt(3),
+            ),
+            -1,
+        )
+        polar = torch.cat(
+            (
+                density[:, :s, s:].reshape(n, s * p * 3),
+                density[:, s:, :s]
+                .reshape(n, p, 3, s)
+                .permute(0, 1, 3, 2)
+                .reshape(n, p * s * 3),
+            ),
+            -1,
+        )
+        axial = torch.einsum("nuavb,abk->nuvk", pp, self.axial_basis).reshape(
+            n, p * p * 3
+        )
+        quadrupole = torch.einsum("nuavb,kab->nuvk", pp, self.quadrupole_basis).reshape(
+            n, p * p * 5
+        )
+        return torch.cat((scalar, polar, axial, quadrupole), -1)
+
+
+class OnsiteExchangeCorrelation(nn.Module):
+    """Spin-even atomic energy from full on-site matrices and local features.
+
+    Inputs are alpha+beta and alpha-beta matrices in Cartesian orbital order.
+    All density derivatives remain available; no effective potential is computed.
+    """
+
+    def __init__(
+        self,
+        n_s,
+        n_p,
+        node_irreps,
+        readout="nonlinear",
+        invariant_channels=16,
+        hidden_features=64,
+    ):
+        super().__init__()
+        if not isinstance(invariant_channels, int) or invariant_channels < 1:
+            raise ValueError("XC invariant_channels must be a positive integer")
+        self.decomposition = _DensityBlockIrreps(n_s, n_p)
+        self.node_irreps = o3.Irreps(node_irreps)
+        self.density_irreps = o3.Irreps(
+            [(invariant_channels, ir) for _, ir in self.decomposition.irreps]
+        )
+        self.total_mix = o3.Linear(
+            self.decomposition.irreps, self.density_irreps, biases=False
+        )
+        self.spin_mix = o3.Linear(
+            self.decomposition.irreps, self.density_irreps, biases=False
+        )
+        available = {ir for mul, ir in self.node_irreps if mul}
+        self.matching = [ir in available for _, ir in self.density_irreps]
+        matching_irreps = o3.Irreps(
+            [
+                (mul, ir)
+                for (mul, ir), match in zip(self.density_irreps, self.matching)
+                if match
+            ]
+        )
+        self.node_projection = o3.Linear(
+            self.node_irreps, matching_irreps, biases=False
+        )
+        self.channels = invariant_channels
+        self.num_scalar = self.decomposition.irreps.count(o3.Irrep("0e"))
+        odd_size = sum(self.matching) * invariant_channels
+        self.spin_invariant_mix = (
+            nn.Linear(odd_size, invariant_channels, bias=False) if odd_size else None
+        )
+        # Raw total scalars, mixed density norms, total-node scalars, squared spin-node scalars.
+        size = (
+            self.num_scalar
+            + 2 * len(self.density_irreps) * invariant_channels
+            + odd_size
+        )
+        if odd_size:
+            size += invariant_channels
+        self.readout = _xc_readout(size, readout, hidden_features)
+
+    def invariants(self, gamma, gamma_spin, node_features):
+        if gamma_spin.shape != gamma.shape or node_features.shape != (
+            gamma.shape[0],
+            self.node_irreps.dim,
+        ):
+            raise ValueError("XC density/node shapes disagree")
+        total = self.decomposition(gamma)
+        spin = self.decomposition(gamma_spin)
+        q, m = self.total_mix(total), self.spin_mix(spin)
+        nodes = self.node_projection(node_features)
+        features, total_node, spin_node = [total[:, : self.num_scalar]], [], []
+        start, node_start = 0, 0
+        for (mul, ir), match in zip(self.density_irreps, self.matching):
+            end = start + mul * ir.dim
+            qi = q[:, start:end].reshape(-1, mul, ir.dim)
+            mi = m[:, start:end].reshape(-1, mul, ir.dim)
+            features.extend((qi.square().sum(-1), mi.square().sum(-1)))
+            if match:
+                hi = nodes[:, node_start : node_start + mul * ir.dim].reshape(
+                    -1, mul, ir.dim
+                )
+                total_node.append((qi * hi).sum(-1))
+                spin_node.append((mi * hi).sum(-1))
+                node_start += mul * ir.dim
+            start = end
+        if spin_node:
+            features.extend(total_node)
+            features.append(self.spin_invariant_mix(torch.cat(spin_node, -1)).square())
+        return torch.cat(features, -1)
+
+    def forward(self, gamma, gamma_spin, node_features):
+        return self.readout(self.invariants(gamma, gamma_spin, node_features)).squeeze(
+            -1
+        )
+
+
+class MultipoleExchangeCorrelation(nn.Module):
+    """Restricted spin-even energy from electronic monopoles/dipoles only.
+
+    Inputs [N,4] are electron-alpha+beta and electron-alpha-beta, ordered
+    (monopole, dipole_y, dipole_z, dipole_x), without nuclear charge.
+    """
+
+    def __init__(
+        self,
+        node_irreps,
+        readout="nonlinear",
+        invariant_channels=16,
+        hidden_features=64,
+        norm_epsilon=0.01,
+    ):
+        super().__init__()
+        if not isinstance(invariant_channels, int) or invariant_channels < 1:
+            raise ValueError("XC invariant_channels must be a positive integer")
+        if not math.isfinite(norm_epsilon) or norm_epsilon <= 0:
+            raise ValueError("XC norm_epsilon must be positive and finite")
+        self.node_irreps = o3.Irreps(node_irreps)
+        self.norm_epsilon = float(norm_epsilon)
+        self.matches = [
+            (sl, mul, ir)
+            for sl, (mul, ir) in zip(self.node_irreps.slices(), self.node_irreps)
+            if ir in (o3.Irrep("0e"), o3.Irrep("1o")) and mul
+        ]
+        count = sum(mul for _, mul, _ in self.matches)
+        self.spin_invariant_mix = (
+            nn.Linear(count, invariant_channels, bias=False) if count else None
+        )
+        self.readout = _xc_readout(
+            4 + count + (invariant_channels if count else 0), readout, hidden_features
+        )
+
+    def invariants(self, electron_multipoles, spin_multipoles, node_features):
+        q, m = electron_multipoles, spin_multipoles
+        if (
+            q.ndim != 2
+            or q.shape[1] != 4
+            or m.shape != q.shape
+            or node_features.shape != (q.shape[0], self.node_irreps.dim)
+        ):
+            raise ValueError(
+                "Expected electronic/spin multipoles [N,4] and matching node features"
+            )
+
+        # Rationalized sqrt(d.d + epsilon^2) - epsilon: smooth at zero.
+        def norm(d):
+            square = d.square().sum(-1, keepdim=True)
+            return square / (
+                torch.sqrt(square + self.norm_epsilon**2) + self.norm_epsilon
+            )
+
+        features = [q[:, :1], norm(q[:, 1:]), m[:, :1].square(), norm(m[:, 1:])]
+        odd = []
+        for sl, mul, ir in self.matches:
+            h = node_features[:, sl].reshape(-1, mul, ir.dim)
+            a, b = (q[:, :1], m[:, :1]) if ir.l == 0 else (q[:, 1:], m[:, 1:])
+            features.append((a[:, None, :] * h).sum(-1))
+            odd.append((b[:, None, :] * h).sum(-1))
+        if odd:
+            features.append(self.spin_invariant_mix(torch.cat(odd, -1)).square())
+        return torch.cat(features, -1)
+
+    def forward(self, electron_multipoles, spin_multipoles, node_features):
+        return self.readout(
+            self.invariants(electron_multipoles, spin_multipoles, node_features)
+        ).squeeze(-1)
+
+
 def assemble_matrix(
     edge_blocks: torch.Tensor,
     edge_index: torch.Tensor,
     num_nodes: int,
-    onsite_blocks: Optional[torch.Tensor] = None,
+    onsite_blocks: torch.Tensor,
 ) -> torch.Tensor:
     """Scatter a full directed edge list, symmetrize, and insert on-site blocks.
 
@@ -101,7 +344,7 @@ def assemble_matrix(
     Every edge must have its reverse. Periodic self-image edges are allowed.
     Reverse-edge completeness is an input contract, not checked here.
     Repeated entries sum, so unintended duplicate edges must be removed upstream.
-    onsite_blocks: optional [N, B, B]; absent means zero on-site blocks.
+    onsite_blocks: required [N, B, B].
     Return [N*B, N*B]. All floating tensors must share dtype and device.
     """
     if num_nodes <= 0:
@@ -119,45 +362,96 @@ def assemble_matrix(
 
     # One forward pass over the full directed list already evaluated +/- r.
     H = 0.5 * (M + M.transpose(-1, -2))
-    if onsite_blocks is not None:
-        if onsite_blocks.shape != (num_nodes, B, B):
-            raise ValueError("Expected on-site blocks with shape [N, B, B]")
-        D = 0.5 * (onsite_blocks + onsite_blocks.transpose(-1, -2))
-        # Add to any periodic self-image contributions on the diagonal.
-        for i in range(num_nodes):
-            H[i * B : (i + 1) * B, i * B : (i + 1) * B] = (
-                H[i * B : (i + 1) * B, i * B : (i + 1) * B] + D[i]
-            )
+    if onsite_blocks.shape != (num_nodes, B, B):
+        raise ValueError("Expected on-site blocks with shape [N, B, B]")
+    D = 0.5 * (onsite_blocks + onsite_blocks.transpose(-1, -2))
+    # Add, rather than overwrite, periodic self-image contributions.
+    indices = torch.arange(num_nodes, device=H.device)[:, None] * B
+    orbitals = indices + torch.arange(B, device=H.device)
+    H[orbitals[:, :, None], orbitals[:, None, :]] += D
     return H
 
 
 class MatrixConstruction(nn.Module):
-    """Glue for the two readouts and assembly; the upstream model is external."""
+    """Independent edge/on-site readouts followed by symmetric assembly."""
 
-    def __init__(self, edge_irreps, n_s: int, n_p: int, onsite_irreps=None):
+    def __init__(self, edge_irreps, n_s, n_p, onsite_irreps):
         super().__init__()
         self.edge_readout = SPBlockReadout(edge_irreps, n_s, n_p)
-        # Deliberately simple: unrestricted on-site coefficients followed by
-        # transpose projection. A minimal symmetric head could remove redundancy.
-        self.onsite_readout = (
-            SPBlockReadout(onsite_irreps, n_s, n_p)
-            if onsite_irreps is not None
-            else None
+        self.onsite_readout = SPBlockReadout(onsite_irreps, n_s, n_p)
+
+    def forward(self, edge_features, edge_index, num_nodes, onsite_features):
+        return assemble_matrix(
+            self.edge_readout(edge_features),
+            edge_index,
+            num_nodes,
+            self.onsite_readout(onsite_features),
         )
 
-    def forward(self, edge_features, edge_index, num_nodes, onsite_features=None):
-        """Readouts have independent parameters; all edges share the edge head."""
-        edge_blocks = self.edge_readout(edge_features)
-        onsite_blocks = None
-        if self.onsite_readout is not None:
-            if onsite_features is None:
-                raise ValueError(
-                    "This module was configured to require on-site features"
-                )
-            onsite_blocks = self.onsite_readout(onsite_features)
-        elif onsite_features is not None:
-            raise ValueError("Configure onsite_irreps to use on-site features")
-        return assemble_matrix(edge_blocks, edge_index, num_nodes, onsite_blocks)
+
+def _uvu_product(left, right, targets, radial=False):
+    """Keep one output copy per angular path, preserving left multiplicity."""
+    left, right, targets = o3.Irreps(left), o3.Irreps(right), o3.Irreps(targets)
+    allowed = {ir for mul, ir in targets if mul}
+    outputs, instructions = [], []
+    for i, (mul, ir_left) in enumerate(left):
+        for j, (_, ir_right) in enumerate(right):
+            for ir in ir_left * ir_right:
+                if ir in allowed:
+                    instructions.append((i, j, len(outputs), "uvu", True))
+                    outputs.append((mul, ir))
+    missing = allowed - {ir for _, ir in outputs}
+    if missing:
+        raise ValueError(f"Tensor product cannot supply required irreps: {missing}")
+    ordered = o3.Irreps(outputs).sort()
+    instructions = [
+        (i, j, ordered.p[k], mode, train) for i, j, k, mode, train in instructions
+    ]
+    return o3.TensorProduct(
+        left,
+        right,
+        ordered.irreps,
+        instructions,
+        internal_weights=not radial,
+        shared_weights=not radial,
+    )
+
+
+def _orbital_order(n_s, n_p):
+    return torch.tensor(
+        list(range(n_s))
+        + [n_s + 3 * shell + j for shell in range(n_p) for j in (2, 0, 1)]
+    )
+
+
+class OnsiteHamiltonianHead(nn.Module):
+    """Quadratic plus direct linear coefficients; symmetric Cartesian blocks."""
+
+    def __init__(self, node_irreps, n_s, n_p, feature_multiplicity=64):
+        super().__init__()
+        if feature_multiplicity < 1:
+            raise ValueError("feature_multiplicity must be positive")
+        features = o3.Irreps(
+            [(feature_multiplicity, ir) for ir in ("0e", "1o", "1e", "2e")]
+        )
+        self.left = o3.Linear(node_irreps, node_irreps)
+        self.right = o3.Linear(node_irreps, node_irreps)
+        self.tp = _uvu_product(node_irreps, node_irreps, features)
+        self.mix = o3.Linear(self.tp.irreps_out, features)
+        self.readout = SPBlockReadout(features, n_s, n_p)
+        self.linear = o3.Linear(
+            node_irreps, self.readout.coefficient_irreps, biases=False
+        )
+        self.register_buffer("orbital_order", _orbital_order(n_s, n_p))
+
+    def forward(self, features):
+        quadratic = self.mix(self.tp(self.left(features), self.right(features)))
+        coefficients = self.readout.readout(quadratic) + self.linear(features)
+        blocks = self.readout.decode(coefficients)
+        blocks = blocks.index_select(-2, self.orbital_order).index_select(
+            -1, self.orbital_order
+        )
+        return (blocks + blocks.transpose(-1, -2)) / 2
 
 
 class HamiltonianBuilder(nn.Module):
@@ -172,15 +466,19 @@ class HamiltonianBuilder(nn.Module):
         node_irreps,
         n_s=2,
         n_p=3,
-        edge_mode="bilinear",
+        edge_mode="tensor_product",
         r_max=3.0,
         num_radial=8,
-        feature_multiplicity=4,
+        feature_multiplicity=64,
         radial_hidden=32,
-        onsite_mode="quadratic",
+        sh_max_l=1,
     ):
         super().__init__()
-        if edge_mode not in {"bilinear", "linear_endpoints"}:
+        edge_mode = {
+            "bilinear": "tensor_product",
+            "linear_endpoints": "endpoint_sum",
+        }.get(edge_mode, edge_mode)
+        if edge_mode not in {"tensor_product", "endpoint_sum"}:
             raise ValueError("Unknown edge mode")
         self.edge_mode = edge_mode
         self.node_irreps = o3.Irreps(node_irreps)
@@ -195,63 +493,46 @@ class HamiltonianBuilder(nn.Module):
             raise ValueError(
                 "Hamiltonian heads require scalar and polar-vector node features"
             )
-        if onsite_mode not in {"quadratic", "direct"}:
-            raise ValueError("onsite_mode must be quadratic or direct")
-        self.onsite_mode = onsite_mode
-        self.sh_irreps = o3.Irreps.spherical_harmonics(1)
+        if isinstance(sh_max_l, bool) or not isinstance(sh_max_l, int) or sh_max_l < 0:
+            raise ValueError("sh_max_l must be a nonnegative integer")
+        self.sh_irreps = o3.Irreps.spherical_harmonics(sh_max_l)
         self.r_max = r_max
         self.register_buffer("radial_centres", torch.linspace(0, r_max, num_radial))
 
-        if edge_mode == "bilinear":
-            self.pair_tp = o3.FullyConnectedTensorProduct(
+        if edge_mode == "tensor_product":
+            self.pair_tp = _uvu_product(
                 self.node_irreps, self.node_irreps, self.node_irreps
             )
-            self.pair_linear = o3.Linear(self.node_irreps, self.node_irreps)
+            self.pair_linear = o3.Linear(self.pair_tp.irreps_out, self.node_irreps)
         else:
             self.sender_linear = o3.Linear(self.node_irreps, self.node_irreps)
             self.receiver_linear = o3.Linear(self.node_irreps, self.node_irreps)
 
-        self.angular_tp = o3.FullyConnectedTensorProduct(
-            self.node_irreps,
-            self.sh_irreps,
-            self.feature_irreps,
-            internal_weights=False,
-            shared_weights=False,
+        self.angular_tp = _uvu_product(
+            self.node_irreps, self.sh_irreps, self.feature_irreps, radial=True
         )
+        self.angular_mix = o3.Linear(self.angular_tp.irreps_out, self.feature_irreps)
         self.radial_mlp = nn.Sequential(
             nn.Linear(num_radial, radial_hidden),
             nn.SiLU(),
             nn.Linear(radial_hidden, self.angular_tp.weight_numel),
         )
 
-        # Independent on-site factors permit cross-channel axial features.
-        self.onsite_left = o3.Linear(self.node_irreps, self.node_irreps)
-        self.onsite_right = o3.Linear(self.node_irreps, self.node_irreps)
-        self.onsite_tp = o3.FullyConnectedTensorProduct(
-            self.node_irreps, self.node_irreps, self.feature_irreps
+        self.onsite_head = OnsiteHamiltonianHead(
+            node_irreps, n_s, n_p, feature_multiplicity
         )
-        self.matrix = MatrixConstruction(
-            self.feature_irreps,
-            n_s,
-            n_p,
-            self.feature_irreps if onsite_mode == "quadratic" else self.node_irreps,
-        )
+        self.edge_readout = SPBlockReadout(self.feature_irreps, n_s, n_p)
         self.block_size = n_s + 3 * n_p
-        # Raw decoded p components follow feature-frame coordinates (y,z,x).
-        # The density map expects Cartesian orbital order (px,py,pz).
-        order = list(range(n_s))
-        for shell in range(n_p):
-            order.extend(n_s + 3 * shell + j for j in (2, 0, 1))
-        self.register_buffer("orbital_order", torch.tensor(order, dtype=torch.long))
+        self.register_buffer("orbital_order", _orbital_order(n_s, n_p))
 
     def forward(self, node_features, positions, edge_index, shifts=None, ptr=None):
         sender, receiver = edge_index
         vectors = positions[receiver] - positions[sender]
         if shifts is not None:
             vectors = vectors + shifts
-        if torch.any(vectors.norm(dim=-1) == 0):
-            raise ValueError("Zero-length Hamiltonian edges are not allowed")
         distances = vectors.norm(dim=-1)
+        if torch.any(distances == 0):
+            raise ValueError("Zero-length Hamiltonian edges are not allowed")
         # Reuse the MACE graph, but decode only edges within the Hamiltonian
         # support. The quintic envelope and its first two derivatives vanish
         # at this boundary, so removing the other edges preserves smoothness.
@@ -270,7 +551,7 @@ class HamiltonianBuilder(nn.Module):
         )
         x = (distances / self.r_max).clamp(0, 1)
         cutoff = 1 - 10 * x**3 + 15 * x**4 - 6 * x**5
-        if self.edge_mode == "bilinear":
+        if self.edge_mode == "tensor_product":
             pair = self.pair_linear(
                 self.pair_tp(node_features[sender], node_features[receiver])
             )
@@ -278,20 +559,18 @@ class HamiltonianBuilder(nn.Module):
             left = self.sender_linear(node_features)
             right = self.receiver_linear(node_features)
             pair = left[sender] + right[receiver]
-        edge_features = self.angular_tp(pair, sh, self.radial_mlp(radial))
-        edge_features = edge_features * cutoff[:, None]
-        onsite_features = (
-            self.onsite_tp(
-                self.onsite_left(node_features), self.onsite_right(node_features)
-            )
-            if self.onsite_mode == "quadratic"
-            else node_features
+        edge_features = self.angular_mix(
+            self.angular_tp(pair, sh, self.radial_mlp(radial))
         )
+        edge_features = edge_features * cutoff[:, None]
         n = positions.shape[0]
         if ptr is None:
             ptr = torch.tensor([0, n], device=positions.device)
-        blocks = self.matrix.edge_readout(edge_features)
-        onsite = self.matrix.onsite_readout(onsite_features)
+        blocks = self.edge_readout(edge_features)
+        blocks = blocks.index_select(-2, self.orbital_order).index_select(
+            -1, self.orbital_order
+        )
+        onsite = self.onsite_head(node_features)
         matrices = []
         used = torch.zeros(sender.shape, dtype=torch.bool, device=sender.device)
         for first, last in zip(ptr[:-1].tolist(), ptr[1:].tolist()):
@@ -308,12 +587,7 @@ class HamiltonianBuilder(nn.Module):
                 last - first,
                 onsite[first:last],
             )
-            order = (
-                torch.arange(last - first, device=positions.device)[:, None]
-                * self.block_size
-                + self.orbital_order
-            ).flatten()
-            matrices.append(raw.index_select(0, order).index_select(1, order))
+            matrices.append(raw)
         if not bool(used.all()):
             raise ValueError("Hamiltonian edges must not connect different graphs")
         return matrices
@@ -383,45 +657,17 @@ def _fill(eps, count, tau, degeneracy_tolerance=1e-9):
     return torch.sigmoid((mu - eps) / tau), mu
 
 
-class FermiDiracOccupations(nn.Module):
-    """Per-spin fixed electron counts. Energies are eV; temperature is K or eV."""
-
-    def __init__(self, elec_temp_units="kelvin", degeneracy_tolerance=1e-9):
-        super().__init__()
-        if elec_temp_units not in {"kelvin", "eV"}:
-            raise ValueError("elec_temp_units must be kelvin or eV")
-        self.elec_temp_units = elec_temp_units
-        self.degeneracy_tolerance = degeneracy_tolerance
-
-    def thermal_energy(self, temperature):
-        return temperature * (
-            8.617333262145e-5 if self.elec_temp_units == "kelvin" else 1.0
-        )
-
-    def forward(self, eigenvalues, populations, elec_temp):
-        tau = self.thermal_energy(elec_temp)
-        fs, mus = zip(
-            *[
-                _fill(eigenvalues, count, tau, self.degeneracy_tolerance)
-                for count in populations
-            ]
-        )
-        f = torch.stack(fs, dim=-1)
-        mu = torch.stack(mus)
-        entropy = eigenvalues.sum() * 0
-        if float(tau.detach()) > 0:
-            for s in range(2):
-                if bool(torch.isfinite(mu[s])):
-                    x = (mu[s] - eigenvalues) / tau
-                    entropy = (
-                        entropy
-                        + tau
-                        * (
-                            fs[s] * torch.nn.functional.logsigmoid(x)
-                            + (1 - fs[s]) * torch.nn.functional.logsigmoid(-x)
-                        ).sum()
-                    )
-        return f, mu, entropy
+def _occupations_and_entropy(eps, count, tau, tolerance):
+    """One canonical channel; entropy is dimensionless negative entropy."""
+    f, mu = _fill(eps, count, tau, tolerance)
+    entropy = tau * 0
+    if float(tau) > 0 and bool(torch.isfinite(mu)):
+        x = (mu - eps) / tau
+        entropy = (
+            f * torch.nn.functional.logsigmoid(x)
+            + (1 - f) * torch.nn.functional.logsigmoid(-x)
+        ).sum()
+    return f, mu, entropy
 
 
 def _smooth_density(H, count, tau, eps, mu, occupations):
@@ -474,7 +720,7 @@ def _smooth_density(H, count, tau, eps, mu, occupations):
 
 
 def _spectral_response(U, eps, f, tau, grad, tolerance):
-    """Fixed-count density VJP from cached eigenpairs; no eigensolve."""
+    """Fixed-population density VJP from cached eigenpairs."""
     G = U.T @ ((grad + grad.T) / 2) @ U
     gaps = eps[:, None] - eps[None, :]
     close = gaps.abs() <= tolerance
@@ -487,133 +733,237 @@ def _spectral_response(U, eps, f, tau, grad, tolerance):
     safe_total = torch.where(total != 0, total, torch.ones_like(total))
     weighted = (fp * G.diagonal()).sum() / safe_total
     response = U @ (divided * G - torch.diag(fp * weighted)) @ U.T
-    width = tau * 0
-    if float(tau) > 0:
-        mean_eps = (fp * eps).sum() / safe_total
-        width = (G.diagonal() * fp * (mean_eps - eps) / tau).sum()
-    return (response + response.T) / 2, weighted, width
+    return (response + response.T) / 2
+
+
+def _occupation_response(U, f, tau, grad):
+    if float(tau) == 0:
+        return torch.zeros_like(U)
+    fp = -f * (1 - f) / tau
+    total = fp.sum()
+    mean = (fp * grad).sum() / torch.where(total != 0, total, torch.ones_like(total))
+    return (U * (fp * (grad - mean))) @ U.T
 
 
 class _CanonicalState(torch.autograd.Function):
-    """Shared-spin spectral state, with cached first and smooth second derivatives."""
+    """One spin channel with an explicit derivative-order contract."""
 
     @staticmethod
-    def forward(ctx, H, counts, tau, tolerance):
+    def forward(ctx, H, count, tau, tolerance, derivative_mode):
         eps, U = torch.linalg.eigh(H)
-        fs, mus, entropies, densities = [], [], [], []
-        for spin in range(2):
-            if spin and bool(counts[0] == counts[1]):
-                f, mu = fs[0], mus[0]
-            else:
-                f, mu = _fill(eps, counts[spin], tau, tolerance)
-            entropy = tau * 0
-            if float(tau) > 0 and bool(torch.isfinite(mu)):
-                x = (mu - eps) / tau
-                entropy = (
-                    f * torch.nn.functional.logsigmoid(x)
-                    + (1 - f) * torch.nn.functional.logsigmoid(-x)
-                ).sum()
-            fs.append(f)
-            mus.append(mu)
-            entropies.append(entropy)
-            densities.append(
-                densities[0] if spin and bool(counts[0] == counts[1]) else (U * f) @ U.T
-            )
-        f, mu, entropy = torch.stack(fs, -1), torch.stack(mus), torch.stack(entropies)
-        P = torch.stack(densities)
-        free = (f * eps[:, None]).sum() + tau * entropy.sum()
-        ctx.save_for_backward(H, counts, tau, eps, U, f, mu, entropy, P)
-        ctx.tolerance = tolerance
-        ctx.mark_non_differentiable(eps, f, mu)
+        f, mu, entropy = _occupations_and_entropy(eps, count, tau, tolerance)
+        P = (U * f) @ U.T
+        free = (f * eps).sum() + tau * entropy
+        ctx.save_for_backward(H, count, tau, eps, U, f, mu, P)
+        ctx.tolerance, ctx.derivative_mode = tolerance, derivative_mode
+        ctx.mark_non_differentiable(eps, mu, U)
         ctx.set_materialize_grads(False)
-        return P, free, eps, f, mu
+        return P, free, eps, f, mu, U
 
     @staticmethod
-    def backward(ctx, grad_P, grad_free, *unused):
-        H, counts, tau, eps, U, f, mu, entropy, saved_P = ctx.saved_tensors
-        if grad_P is None:
-            grad_P = H.new_zeros((2,) + H.shape)
-        if grad_free is None:
-            grad_free = H.new_zeros(())
+    def backward(ctx, grad_P, grad_free, unused_eps, grad_f, unused_mu, unused_U):
+        H, count, tau, eps, U, f, mu, saved_P = ctx.saved_tensors
         if torch.is_grad_enabled():
-            if float(tau.detach()) == 0:
+            if ctx.derivative_mode != "second_order":
                 raise RuntimeError(
-                    "Force gradients require positive electronic smearing"
+                    "first_order electronic state does not support higher derivatives"
                 )
-            inputs = tuple(
-                t if t.requires_grad else t.detach().requires_grad_(True)
-                for t in (H, counts, tau)
+            if grad_f is not None:
+                raise RuntimeError("Occupation outputs support first derivatives only")
+            P, _ = _smooth_density(H, count, tau, eps, mu, f)
+            response = (
+                H * 0
+                if grad_P is None
+                else torch.autograd.grad(
+                    P, H, grad_P, create_graph=True, retain_graph=True
+                )[0]
             )
-            h, populations, width = inputs
-            shared = not counts.requires_grad and bool(counts[0] == counts[1])
-            densities, potentials = [], []
-            for spin in range(2):
-                if spin and shared:
-                    density, potential = densities[0], potentials[0]
-                else:
-                    density, potential = _smooth_density(
-                        h, populations[spin], width, eps, mu[spin], f[:, spin]
-                    )
-                densities.append(density)
-                potentials.append(potential)
-            P = torch.stack(densities)
-            dH, dN, dt = torch.autograd.grad(P, inputs, grad_P, create_graph=True)
-            # Entropy value plus its exact local differential, sufficient for
-            # double backward without a matrix logarithm or another eigensolve.
-            ds = []
-            for spin in range(2):
-                if not bool(torch.isfinite(mu[spin])):
-                    ds.append(width * 0)
-                else:
-                    eye = torch.eye(H.shape[0], dtype=H.dtype, device=H.device)
-                    coefficient = ((h - potentials[spin] * eye) / width).detach()
-                    delta = densities[spin] - densities[spin].detach()
-                    ds.append(entropy[spin] - (coefficient * delta).sum())
-            finite_mu = torch.stack(
-                [
-                    potential if bool(torch.isfinite(mu[i])) else populations[i] * 0
-                    for i, potential in enumerate(potentials)
-                ]
+        else:
+            P = saved_P
+            response = (
+                torch.zeros_like(H)
+                if grad_P is None
+                else _spectral_response(U, eps, f, tau, grad_P, ctx.tolerance)
             )
-            return (
-                dH + grad_free * P.sum(0),
-                dN + grad_free * finite_mu,
-                dt + grad_free * torch.stack(ds).sum(),
-                None,
-            )
-        if not counts.requires_grad and bool(counts[0] == counts[1]):
-            response, _, width = _spectral_response(
-                U, eps, f[:, 0], tau, grad_P.sum(0), ctx.tolerance
-            )
-            return (
-                response + grad_free * saved_P.sum(0),
-                None,
-                width + grad_free * entropy.sum(),
-                None,
-            )
-        dH, dN, dt = torch.zeros_like(H), [], tau * 0
-        for spin in range(2):
-            response, population, width = _spectral_response(
-                U, eps, f[:, spin], tau, grad_P[spin], ctx.tolerance
-            )
-            dH = dH + response + grad_free * saved_P[spin]
-            potential = mu[spin] if bool(torch.isfinite(mu[spin])) else mu.new_zeros(())
-            dN.append(population + grad_free * potential)
-            dt = dt + width + grad_free * entropy[spin]
-        return dH, torch.stack(dN), dt, None
+            if grad_f is not None:
+                response = response + _occupation_response(U, f, tau, grad_f)
+        if grad_free is not None:
+            response = response + grad_free * P
+        return response, None, None, None, None
+
+
+class _GaussianDOS(torch.autograd.Function):
+    """First-order smooth spectral observables, sharing an existing eigensolve."""
+
+    @staticmethod
+    def forward(ctx, H, eps, U, grid, width):
+        ctx.save_for_backward(eps, U, grid, width)
+        ctx.set_materialize_grads(False)
+        dos, cumulative = [], []
+        for energies in grid.split(128):
+            z = (energies[:, None] - eps[None, :]) / width
+            phi = torch.exp(-0.5 * z.square()) / math.sqrt(2 * math.pi)
+            dos.append(phi.sum(-1) / width)
+            cumulative.append((0.5 * torch.erfc(-z / math.sqrt(2))).sum(-1))
+        return torch.cat(dos), torch.cat(cumulative)
+
+    @staticmethod
+    def backward(ctx, grad_dos, grad_cumulative):
+        if torch.is_grad_enabled():
+            raise RuntimeError("DOS outputs support first derivatives only")
+        eps, U, grid, width = ctx.saved_tensors
+        v = torch.zeros_like(eps)
+        for start in range(0, grid.numel(), 128):
+            end = start + 128
+            z = (grid[start:end, None] - eps[None, :]) / width
+            phi = torch.exp(-0.5 * z.square()) / math.sqrt(2 * math.pi)
+            if grad_dos is not None:
+                v += (grad_dos[start:end, None] * z * phi / width.square()).sum(0)
+            if grad_cumulative is not None:
+                v -= (grad_cumulative[start:end, None] * phi / width).sum(0)
+        response = (U * v) @ U.T
+        return (response + response.T) / 2, None, None, None, None
 
 
 class ElectronicState(nn.Module):
-    """Solve independent dense Hamiltonians and return on-site density blocks."""
+    """RKS/UKS dense states; populations and smearing are constant inputs.
 
-    def __init__(self, block_size, elec_temp_units="kelvin", degeneracy_tolerance=1e-9):
+    RKS accepts a list of matrices; UKS a list of (alpha, beta) pairs.
+    Spin mode is fixed at construction. Derivative mode is explicit per call.
+    """
+
+    def __init__(
+        self,
+        block_size,
+        spin_mode,
+        elec_temp_units="kelvin",
+        dos_grid=None,
+        dos_width=0.2,
+        degeneracy_tolerance=1e-9,
+    ):
         super().__init__()
-        self.block_size = block_size
-        self.occupations = FermiDiracOccupations(elec_temp_units, degeneracy_tolerance)
+        if spin_mode not in {"RKS", "UKS"}:
+            raise ValueError("spin_mode must be RKS or UKS")
+        if elec_temp_units not in {"kelvin", "eV"}:
+            raise ValueError("elec_temp_units must be kelvin or eV")
+        if not isinstance(block_size, int) or block_size < 1:
+            raise ValueError("block_size must be a positive integer")
+        if not math.isfinite(degeneracy_tolerance) or degeneracy_tolerance < 0:
+            raise ValueError("degeneracy_tolerance must be finite and nonnegative")
+        grid = (
+            torch.linspace(-15, 5, 100)
+            if dos_grid is None
+            else torch.as_tensor(dos_grid, dtype=torch.get_default_dtype())
+        )
+        width = torch.as_tensor(dos_width, dtype=torch.get_default_dtype())
+        if grid.requires_grad or width.requires_grad:
+            raise ValueError("DOS grid and width must be constant")
+        if (
+            grid.ndim != 1
+            or grid.numel() == 0
+            or not bool(torch.isfinite(grid).all())
+            or not bool((grid[1:] > grid[:-1]).all())
+        ):
+            raise ValueError(
+                "dos_grid must be finite, nonempty and strictly increasing"
+            )
+        if width.ndim != 0 or not bool(torch.isfinite(width)) or float(width) <= 0:
+            raise ValueError("dos_width must be positive and finite")
+        self.register_buffer("dos_grid", grid.clone())
+        self.register_buffer("dos_width", width.clone())
+        self.block_size, self.spin_mode = block_size, spin_mode
+        self.elec_temp_units, self.degeneracy_tolerance = (
+            elec_temp_units,
+            degeneracy_tolerance,
+        )
 
-    def forward(self, hamiltonians, N_alpha, N_beta, elec_temp):
-        gamma, spin, bands, entropies, mus, residuals, values, fillings = (
-            [],
+    def thermal_energy(self, temperature):
+        return temperature * (
+            8.617333262145e-5 if self.elec_temp_units == "kelvin" else 1.0
+        )
+
+    def _channel(self, H, count, tau, mode, full, eigenvectors):
+        if (
+            H.ndim != 2
+            or H.shape[0] != H.shape[1]
+            or H.shape[0] == 0
+            or H.shape[0] % self.block_size
+        ):
+            raise ValueError(
+                "Hamiltonian must be nonempty, square and divisible by block_size"
+            )
+        if not bool(torch.isfinite(H).all()) or not torch.allclose(H, H.T):
+            raise ValueError("Hamiltonian must be finite and symmetric")
+        if mode == "none":
+            with torch.no_grad():
+                P, free, eps, f, mu, U = _CanonicalState.apply(
+                    H.detach(), count, tau, self.degeneracy_tolerance, mode
+                )
+                dos, cumulative = _GaussianDOS.apply(
+                    H.detach(), eps, U, self.dos_grid, self.dos_width
+                )
+        else:
+            P, free, eps, f, mu, U = _CanonicalState.apply(
+                H, count, tau, self.degeneracy_tolerance, mode
+            )
+            dos, cumulative = _GaussianDOS.apply(
+                H, eps, U, self.dos_grid, self.dos_width
+            )
+        band = (P * (H.detach() if mode == "none" else H)).sum()
+        B = self.block_size
+        onsite = (
+            P.reshape(-1, B, H.shape[0] // B, B)
+            .diagonal(dim1=0, dim2=2)
+            .permute(2, 0, 1)
+        )
+        diagnostic = dict(
+            eigenvalues=eps,
+            occupations=f,
+            chemical_potential=mu,
+            count_residual=f.detach().sum() - count,
+        )
+        if full:
+            diagnostic["density"] = P
+        if eigenvectors:
+            diagnostic["eigenvectors"] = U
+        return onsite, band, free - band, dos, cumulative, diagnostic
+
+    def forward(
+        self,
+        hamiltonians,
+        N_alpha,
+        N_beta,
+        elec_temp,
+        *,
+        derivative_mode,
+        return_full_density=False,
+        return_eigenvectors=False,
+    ):
+        if derivative_mode not in {"none", "first_order", "second_order"}:
+            raise ValueError("Unknown derivative_mode")
+        if derivative_mode != "none" and not torch.is_grad_enabled():
+            raise RuntimeError(
+                "Differentiable electronic mode requires gradient recording"
+            )
+        ng = len(hamiltonians)
+        if not ng:
+            raise ValueError("Require at least one Hamiltonian")
+        for value in (N_alpha, N_beta, elec_temp):
+            if value.requires_grad:
+                raise ValueError("Populations and temperature must be constant inputs")
+            if value.shape != (ng,) or not bool(torch.isfinite(value).all()):
+                raise ValueError(
+                    "Populations and temperature must be finite [num_graphs] tensors"
+                )
+        if bool((elec_temp < 0).any()):
+            raise ValueError("Electronic temperature must be nonnegative")
+        if derivative_mode == "second_order" and bool((elec_temp == 0).any()):
+            raise ValueError("second_order requires positive electronic smearing")
+        if self.spin_mode == "RKS" and not torch.equal(N_alpha, N_beta):
+            raise ValueError("RKS requires N_alpha == N_beta")
+        if self.spin_mode == "UKS" and bool((N_alpha < N_beta).any()):
+            raise ValueError("UKS requires N_alpha >= N_beta")
+        gamma, spin, bands, entropies, dos, cumulative, states = (
             [],
             [],
             [],
@@ -622,31 +972,51 @@ class ElectronicState(nn.Module):
             [],
             [],
         )
-        for g, H in enumerate(hamiltonians):
-            counts = torch.stack((N_alpha[g], N_beta[g]))
-            tau = self.occupations.thermal_energy(elec_temp[g])
-            densities, free_band, eps, f, mu = _CanonicalState.apply(
-                H, counts, tau, self.occupations.degeneracy_tolerance
+        mus, residuals = [], []
+        for g, matrices in enumerate(hamiltonians):
+            if self.spin_mode == "RKS":
+                if not isinstance(matrices, torch.Tensor):
+                    raise ValueError("RKS accepts one matrix per graph")
+                matrices = (matrices,)
+            elif not isinstance(matrices, (tuple, list)) or len(matrices) != 2:
+                raise ValueError("UKS accepts an alpha/beta matrix pair per graph")
+            if self.spin_mode == "UKS" and matrices[0].shape != matrices[1].shape:
+                raise ValueError("UKS matrices must share an orbital layout")
+            tau = self.thermal_energy(elec_temp[g])
+            channels = [
+                self._channel(
+                    H,
+                    (N_alpha, N_beta)[s][g],
+                    tau,
+                    derivative_mode,
+                    return_full_density,
+                    return_eigenvectors,
+                )
+                for s, H in enumerate(matrices)
+            ]
+            a, b = channels[0], channels[-1]
+            gamma.append(a[0] + b[0])
+            spin.append(a[0] - b[0])
+            bands.append(a[1] + b[1])
+            entropies.append(a[2] + b[2])
+            dos.append(torch.stack((a[3], b[3])))
+            cumulative.append(torch.stack((a[4], b[4])))
+            states.append(tuple(c[5] for c in channels))
+            mus.append(
+                torch.stack((a[5]["chemical_potential"], b[5]["chemical_potential"]))
             )
-            total, difference = densities[0] + densities[1], densities[0] - densities[1]
-            B = self.block_size
-            gamma.extend(total[i : i + B, i : i + B] for i in range(0, H.shape[0], B))
-            spin.extend(
-                difference[i : i + B, i : i + B] for i in range(0, H.shape[0], B)
+            residuals.append(
+                torch.stack((a[5]["count_residual"], b[5]["count_residual"]))
             )
-            bands.append((total * H).sum())
-            entropies.append(free_band - bands[-1])
-            mus.append(mu)
-            residuals.append(f.sum(0) - counts.detach())
-            values.append(eps)
-            fillings.append(f)
         return dict(
-            gamma=torch.stack(gamma),
-            gamma_spin=torch.stack(spin),
+            gamma=torch.cat(gamma),
+            gamma_spin=torch.cat(spin),
             band_energy=torch.stack(bands),
             entropy_energy=torch.stack(entropies),
+            dos=torch.stack(dos),
+            cumulative_dos=torch.stack(cumulative),
+            spectral_states=states,
             chemical_potentials=torch.stack(mus),
             count_residuals=torch.stack(residuals),
-            eigenvalues=values,
-            occupations=fillings,
+            derivative_mode=derivative_mode,
         )

@@ -34,8 +34,8 @@ def make_model_wrapper(
 ):
     model_class = model.__class__.__name__
 
-    if model_class == "MLDFTB":
-        return MLDFTBModelWrapper(optimizer=optimizer, output_args=output_args)
+    if model_class in {"OneShotMLUKS", "OneShotMLRKS"}:
+        return OneShotModelWrapper(optimizer=optimizer, output_args=output_args)
     elif model_class in ["MACE", "ScaleShiftMACE"]:
         return DefaultModelWrapper(
             optimizer=optimizer,
@@ -526,7 +526,7 @@ class QEqModelWrapper:
             )
 
 
-class MLDFTBModelWrapper(DefaultModelWrapper):
+class OneShotModelWrapper(DefaultModelWrapper):
     """Direct non-SCF evaluation, restoring training gradients after validation."""
 
     def __call__(self, model, batch_dict, training=False, ema=None):

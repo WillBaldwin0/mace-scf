@@ -11,6 +11,7 @@ import ast
 import logging
 import os
 import numpy as np
+from mace_scf.data.electronic_inputs import validate_configuration
 from mace import tools
 
 
@@ -208,47 +209,18 @@ def load_train_valid_sets_from_xyz(args: argparse.Namespace,  config_type_weight
         allow_low_density_pbc=args.allow_low_density_pbc,
     )
 
-    if args.model == "MLDFTB":
+    if args.model in {"OneShotMLUKS", "OneShotMLRKS"}:
         options = args.mldftb_config
         if isinstance(options, str):
             options = ast.literal_eval(options)
         for split, configs in _named_config_splits(collections):
             for index, config in enumerate(configs):
-                context = f"MLDFTB {split} configuration {index}"
-                properties = config.properties
-                for key in ("N_alpha", "N_beta"):
-                    value = properties.get(key)
-                    capacity = len(config.atomic_numbers) * (
-                        options.get("n_s", 1) + 3 * options.get("n_p", 1)
-                    )
-                    if (
-                        value is None
-                        or np.asarray(value).size != 1
-                        or not np.isfinite(value)
-                        or not 0 <= float(value) <= capacity
-                    ):
-                        raise ValueError(
-                            f"{context}: {key} must be a finite count in [0,{capacity}], not {value}"
-                        )
-                if options.get("nuclear_charge_mode", "per_species") == "from_data":
-                    if properties.get("effective_nuclear_charges") is None:
-                        raise ValueError(
-                            f"{context}: missing effective_nuclear_charges array"
-                        )
-                multipoles = properties.get("atomic_multipoles")
-                if multipoles is not None and np.asarray(multipoles).shape != (
-                    len(config.atomic_numbers),
-                    4,
-                ):
-                    # Higher multipoles may be supplied: the loader keeps l<=1.
-                    if (
-                        np.asarray(multipoles).ndim != 2
-                        or np.asarray(multipoles).shape[0] != len(config.atomic_numbers)
-                        or np.asarray(multipoles).shape[1] < 4
-                    ):
-                        raise ValueError(
-                            f"{context}: atomic_multipoles requires at least four columns"
-                        )
+                context = f"{args.model} {split} configuration {index}"
+                try:
+                    validate_configuration(config, options, args.model[-3:],
+                                           getattr(args, "skip_projected_spin_check", False))
+                except (ValueError, KeyError) as error:
+                    raise ValueError(f"{context}: {error}") from error
 
     # Atomic number table
     z_table = tools.get_atomic_number_table_from_zs(
@@ -275,7 +247,7 @@ def load_train_valid_sets_from_xyz(args: argparse.Namespace,  config_type_weight
             z_table=z_table, 
             cutoff=args.r_max, 
             atomic_multipoles_max_l=args.atomic_multipoles_max_l,
-            preserve_cell=args.model == "MLDFTB",
+            preserve_cell=args.model in {"OneShotMLUKS", "OneShotMLRKS"},
         )
         for config in collections.train
     ]
@@ -286,7 +258,7 @@ def load_train_valid_sets_from_xyz(args: argparse.Namespace,  config_type_weight
             z_table=z_table, 
             cutoff=args.r_max, 
             atomic_multipoles_max_l=args.atomic_multipoles_max_l,
-            preserve_cell=args.model == "MLDFTB",
+            preserve_cell=args.model in {"OneShotMLUKS", "OneShotMLRKS"},
         )
         for config in collections.valid
     ]

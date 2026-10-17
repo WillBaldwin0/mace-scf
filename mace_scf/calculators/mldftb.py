@@ -9,6 +9,7 @@ for per-atom nuclear charges, atoms.arrays. Changes to them invalidate caching.
 from copy import deepcopy
 
 import numpy as np
+from mace_scf.data.electronic_inputs import validate_configuration
 import torch
 from ase.calculators.calculator import Calculator, all_changes
 from ase.stress import full_3x3_to_voigt_6_stress
@@ -16,7 +17,7 @@ from mace.data import KeySpecification, config_from_atoms
 from mace.tools import AtomicNumberTable, torch_geometric
 
 from mace_scf.data import ExtAtomicData
-from mace_scf.electrostatics.mldftb import MLDFTB
+from mace_scf.electrostatics.mldftb import OneShotMLRKS, OneShotMLUKS
 
 
 class MLDFTBCalculator(Calculator):
@@ -32,6 +33,7 @@ class MLDFTBCalculator(Calculator):
         "atomic_spin",
         "local_energy",
         "band_energy",
+        "xc_energy",
         "electrostatic_energy",
         "entropy_energy",
         "electronic_free_energy",
@@ -45,6 +47,9 @@ class MLDFTBCalculator(Calculator):
         model=None,
         device="cpu",
         default_dtype="float64",
+        skip_projected_spin_check=False,
+        atomic_spin_key="atomic_spin",
+        atomic_multipoles_key="atomic_multipoles",
         N_alpha_key="N_alpha",
         N_beta_key="N_beta",
         elec_temp_key="elec_temp",
@@ -66,8 +71,8 @@ class MLDFTBCalculator(Calculator):
             if model is None
             else deepcopy(model)
         )
-        if not isinstance(self.model, MLDFTB):
-            raise TypeError("MLDFTBCalculator requires an MLDFTB model")
+        if not isinstance(self.model, (OneShotMLRKS, OneShotMLUKS)):
+            raise TypeError("MLDFTBCalculator requires a OneShotMLRKS or OneShotMLUKS model")
         self.model.to(device=self.device, dtype=self.dtype).eval()
         for parameter in self.model.parameters():
             parameter.requires_grad_(False)
@@ -82,10 +87,11 @@ class MLDFTBCalculator(Calculator):
             total_charge=total_charge_key,
             external_field=external_field_key,
         )
+        self.skip_projected_spin_check = skip_projected_spin_check
         self.nuclear_key = effective_nuclear_charges_key
         self.keyspec = KeySpecification(
             info_keys=self.info_keys,
-            arrays_keys={"effective_nuclear_charges": self.nuclear_key},
+            arrays_keys={"effective_nuclear_charges": self.nuclear_key, "atomic_spin": atomic_spin_key, "atomic_multipoles": atomic_multipoles_key},
         )
 
     def check_state(self, atoms, tol=1e-15):
@@ -95,18 +101,16 @@ class MLDFTBCalculator(Calculator):
                 old, new = self.atoms.info.get(key), atoms.info.get(key)
                 if not np.array_equal(old, new):
                     changes.append(key)
-            if not np.array_equal(
-                self.atoms.arrays.get(self.nuclear_key),
-                atoms.arrays.get(self.nuclear_key),
-            ):
-                changes.append(self.nuclear_key)
+            for key in self.keyspec.arrays_keys.values():
+                if not np.array_equal(self.atoms.arrays.get(key), atoms.arrays.get(key)):
+                    changes.append(key)
         return changes
 
     def calculate(self, atoms=None, properties=None, system_changes=all_changes):
         super().calculate(atoms, properties, system_changes)
         # ASE copies info shallowly; retain a snapshot of mutable field arrays.
         self.atoms.info = deepcopy(self.atoms.info)
-        for name in ("N_alpha", "N_beta"):
+        for name in ("N_alpha", "N_beta", "total_charge"):
             if self.info_keys[name] not in self.atoms.info:
                 raise ValueError(
                     f"Missing atoms.info[{self.info_keys[name]!r}] ({name})"
@@ -114,6 +118,12 @@ class MLDFTBCalculator(Calculator):
         config = config_from_atoms(
             self.atoms, key_specification=self.keyspec, head_name=self.head
         )
+        nuclei = self.model.density_electrostatics.nuclei
+        validate_configuration(config, {
+            "n_s": self.model.electronic_state.block_size, "n_p": 0,
+            "nuclear_charge_mode": nuclei.charge_mode,
+            "effective_nuclear_charges": dict(zip(self.z_table.zs, nuclei.effective_charges.detach().cpu().tolist())),
+        }, self.model.spin_mode, self.skip_projected_spin_check)
         # ExtAtomicData uses the global default dtype when building the graph.
         # Restore it afterwards; all graph floats now match the model dtype.
         previous_dtype = torch.get_default_dtype()
@@ -132,7 +142,7 @@ class MLDFTBCalculator(Calculator):
         batch = next(
             iter(torch_geometric.dataloader.DataLoader([data], batch_size=1))
         ).to(self.device)
-        output = self.model(batch, compute_stress=bool(self.atoms.cell.volume > 1e-10))
+        output = self.model(batch, compute_stress=bool(self.atoms.cell.volume > 1e-10), return_electronic_state=True)
 
         def array(key):
             return output[key].detach().cpu().numpy()
@@ -144,6 +154,7 @@ class MLDFTBCalculator(Calculator):
             scalar("local_energy")
             + scalar("band_energy")
             + scalar("electrostatic_energy")
+            + scalar("xc_energy")
         )
         self.results = dict(
             energy=internal,
@@ -166,8 +177,14 @@ class MLDFTBCalculator(Calculator):
                 for key in (
                     "local_energy",
                     "band_energy",
+                    "xc_energy",
                     "electrostatic_energy",
                     "entropy_energy",
                 )
             },
+            Hs=output["hamiltonians"],
+            gammas=output["gamma"],
+            dos=array("dos")[0],
+            cumulative_dos=array("cumulative_dos")[0],
+            dos_grid=array("dos_grid"),
         )

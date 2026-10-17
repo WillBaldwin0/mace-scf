@@ -10,10 +10,6 @@ import math
 import torch
 from torch import nn
 from graph_longrange.energy import GTOElectrostaticEnergy
-from graph_longrange.features import GTOElectrostaticFeatures
-from graph_longrange.gto_utils import gto_basis_kspace_cutoff
-from graph_longrange.kspace import compute_k_vectors_flat
-from graph_longrange.utils import CUBIC_MADELUNG
 
 
 class ShellCoupling(nn.Module):
@@ -166,185 +162,9 @@ class NuclearSourceModel(nn.Module):
         return nuclear - q, nuclear, Z
 
 
-class ElectrostaticEnergy(nn.Module):
-    """Per-graph dispatch supports cell-free molecules and mixed periodic batches.
-
-    'auto' uses realspace for molecules, pbc for 3D and slab for xy-periodic
-    cells. Realspace inherits graph_longrange's finite-difference dipole kernel.
-    Its explicit projection stencil is aligned with that of the energy.
-    """
-
-    def __init__(
-        self, basis, self_policy="full", pbc_handling="auto", kspace_cutoff_factor=1.5
-    ):
-        super().__init__()
-        if self_policy not in {"full", "subtract_nuclear", "subtract_atomic"}:
-            raise ValueError("Unknown self-interaction policy")
-        modes = ("realspace", "pbc", "slab", "molecule_in_box")
-        if pbc_handling not in (*modes, "auto", "mixed_periodic"):
-            raise ValueError("Unknown boundary handling mode")
-        if not math.isfinite(kspace_cutoff_factor) or kspace_cutoff_factor <= 0:
-            raise ValueError("kspace_cutoff_factor must be positive")
-        self.self_policy, self.pbc_handling = self_policy, pbc_handling
-        cutoff = kspace_cutoff_factor * gto_basis_kspace_cutoff([basis.sigma], 1)
-        self.register_buffer("kspace_cutoff", torch.tensor(cutoff))
-        self.energies = nn.ModuleDict()
-        self.projections = nn.ModuleDict()
-        for mode in modes:
-            self.energies[mode] = GTOElectrostaticEnergy(
-                1, basis.sigma, cutoff, include_self_interaction=True, pbc_handling=mode
-            )
-            self.projections[mode] = GTOElectrostaticFeatures(
-                1,
-                basis.sigma,
-                1,
-                [basis.sigma],
-                True,
-                cutoff,
-                integral_normalization="multipoles",
-                pbc_handling=mode,
-            )
-            # graph_longrange currently uses 0.02 for energy, 0.1 for features.
-            # Align both the displacements and inverse-offset normalization.
-            f = self.projections[mode].realspace_features
-            offset = self.energies[mode].realspace_energy.offset
-            ratio = offset / f.offset
-            for name in ("x", "y", "z"):
-                getattr(f, name).mul_(ratio)
-            f.l1_factors.div_(ratio)
-            f.offset = offset
-
-    def _mode(self, pbc):
-        if self.pbc_handling in {"auto", "mixed_periodic"}:
-            if not bool(pbc.any()):
-                return (
-                    "molecule_in_box"
-                    if self.pbc_handling == "mixed_periodic"
-                    else "realspace"
-                )
-            if bool(pbc.all()):
-                return "pbc"
-            if pbc.tolist() == [True, True, False]:
-                return "slab"
-            raise NotImplementedError(
-                "Only open, 3D and xy-slab boundaries are supported"
-            )
-        if self.pbc_handling in {"realspace", "molecule_in_box"} and bool(pbc.any()):
-            raise ValueError("Selected electrostatics mode requires open boundaries")
-        if self.pbc_handling == "pbc" and not bool(pbc.all()):
-            raise ValueError("pbc requires three periodic axes")
-        if self.pbc_handling == "slab" and pbc.tolist() != [True, True, False]:
-            raise ValueError("slab requires xy periodicity")
-        return self.pbc_handling
-
-    def forward(
-        self,
-        c,
-        nuclear,
-        geometry,
-        external_field,
-        compute_energy=True,
-        compute_projections=False,
-    ):
-        positions, cells, pbc, ptr = (
-            geometry[k] for k in ("positions", "cell", "pbc", "ptr")
-        )
-        full, corrections, fields, projected = [], [], [], []
-        for graph, (first, last) in enumerate(zip(ptr[:-1].tolist(), ptr[1:].tolist())):
-            x, source = positions[first:last], c[first:last]
-            mode = self._mode(pbc[graph])
-            cell = cells[graph : graph + 1]
-            batch = torch.zeros(last - first, dtype=torch.long, device=c.device)
-            if mode == "realspace":
-                kv, kn = c.new_empty((0, 3)), c.new_empty(0)
-                kb = torch.empty(0, dtype=torch.long, device=c.device)
-                k0, volume = c.new_empty(0), c.new_ones(1)
-            else:
-                volume = torch.linalg.det(cell)
-                if not bool((volume > 1e-10).all()):
-                    raise ValueError(
-                        "Reciprocal electrostatics requires a right-handed, nonsingular cell"
-                    )
-                reciprocal = 2 * math.pi * torch.linalg.inv(cell.mT)
-                kv, kn, kb, k0 = compute_k_vectors_flat(
-                    self.kspace_cutoff, cell, reciprocal
-                )
-            kwargs = dict(
-                k_vectors=kv,
-                k_norm2=kn,
-                k_vector_batch=kb,
-                k0_mask=k0,
-                source_feats=source,
-                node_positions=x,
-                batch=batch,
-                volume=volume,
-                pbc=pbc[graph : graph + 1],
-            )
-            engine = self.energies[mode]
-            full.append(
-                engine(**kwargs).reshape(()) if compute_energy else c.new_zeros(())
-            )
-            correction = source.sum() * 0
-            if self.self_policy != "full":
-                subtract = (
-                    nuclear[first:last]
-                    if self.self_policy == "subtract_nuclear"
-                    else source
-                )
-                self_fields = engine.self_interaction_terms(subtract)
-                correction = -0.5 * (subtract * self_fields).sum()
-            corrections.append(correction)
-            dipole = (source[:, :1] * x + source[:, [3, 1, 2]]).sum(0)
-            fields.append(-(dipole * external_field[graph]).sum())
-            if compute_projections:
-                projection_mode = "pbc" if mode == "molecule_in_box" else mode
-                w = self.projections[projection_mode](**kwargs)
-                if mode == "molecule_in_box":
-                    # Explicit adjoint of the library's finite-box energy correction.
-                    # Its feature correction currently uses a different exponent
-                    # for L=V**(1/3), so it is not exactly the energy derivative.
-                    Q = source[:, 0].sum()
-                    local_dipoles = source[:, [3, 1, 2]]
-                    moment = (source[:, :1] * x + local_dipoles).sum(0)
-                    radius2 = x.square().sum(-1)
-                    second = (
-                        source[:, 0] * radius2 + 2 * (local_dipoles * x).sum(-1)
-                    ).sum()
-                    const = engine.monopole_dipole_correction.const
-                    factor = 2 * math.pi * const / (3 * volume[0])
-                    scalar = CUBIC_MADELUNG * const * Q / volume[0] ** 0.3333
-                    scalar = scalar + factor * (
-                        2 * (x * moment).sum(-1) - second - Q * radius2
-                    )
-                    dipolar = 2 * factor * (moment - Q * x)
-                    w = w + torch.cat((scalar[:, None], dipolar[:, [1, 2, 0]]), -1)
-                if self.self_policy == "subtract_atomic":
-                    w = w - engine.self_interaction_terms(source)
-                # Signed-charge coefficient derivative of -mu.E.
-                field = external_field[graph]
-                w = w + torch.cat(
-                    (
-                        -(x * field).sum(-1, keepdim=True),
-                        -field[[1, 2, 0]].expand(last - first, 3),
-                    ),
-                    dim=-1,
-                )
-                projected.append(w)
-                # The library exposes a cache; don't retain this forward's graph.
-                self.projections[projection_mode].static_quantities = None
-        contributions = dict(
-            coulomb_full=torch.stack(full),
-            self_correction=torch.stack(corrections),
-            field=torch.stack(fields),
-        )
-        return dict(
-            energy=sum(contributions.values()),
-            contributions=contributions,
-            projections=torch.cat(projected) if compute_projections else None,
-        )
-
-
 class DensityElectrostatics(nn.Module):
+    """Map electronic densities to multipoles and evaluate their GLR energy."""
+
     def __init__(
         self,
         n_s,
@@ -359,9 +179,12 @@ class DensityElectrostatics(nn.Module):
         nuclear_charge_mode="per_species",
         self_policy="full",
         pbc_handling="auto",
-        kspace_cutoff_factor=1.5,
+        *,
+        kspace_cutoff,
     ):
         super().__init__()
+        if self_policy not in {"full", "subtract_atomic"}:
+            raise ValueError("self_policy must be full or subtract_atomic")
         self.basis = DensityBasis(sigma, pp_scalar, keep_quadrupoles)
         self.density_map = ElectronicDensityMap(
             ShellCoupling(n_s, n_p, coupling_mode, C), ProductDensityMap(self.basis)
@@ -369,61 +192,92 @@ class DensityElectrostatics(nn.Module):
         self.nuclei = NuclearSourceModel(
             effective_charges, nuclear_profile, nuclear_charge_mode
         )
-        self.electrostatics = ElectrostaticEnergy(
-            self.basis, self_policy, pbc_handling, kspace_cutoff_factor
+        self.coulomb_energy = GTOElectrostaticEnergy(
+            density_max_l=1,
+            density_smearing_width=sigma,
+            kspace_cutoff=kspace_cutoff,
+            include_self_interaction=self_policy == "full",
+            pbc_handling=pbc_handling,
         )
+
+    def multipoles(self, gamma, gamma_spin, species, effective_nuclear_charges=None):
+        """Return electronic spin multipoles and signed nuclear-plus-electron multipoles."""
+        if gamma_spin.shape != gamma.shape:
+            raise ValueError("gamma_spin must have the same shape as gamma")
+        total = self.density_map(gamma)
+        difference = self.density_map(gamma_spin)
+        net_charge, _, _ = self.nuclei(total, species, effective_nuclear_charges)
+        return {
+            "electron_alpha": 0.5 * (total + difference),
+            "electron_beta": 0.5 * (total - difference),
+            "net_charge": net_charge,
+        }
+
+    def electrostatic_energy(self, net_charge, geometry, external_field=None):
+        """Evaluate energy with prepared reciprocal geometry and field = +grad(V)."""
+        num_graphs = geometry["volume"].numel()
+        coulomb = self.coulomb_energy(
+            source_feats=net_charge,
+            node_positions=geometry["positions"],
+            batch=geometry["batch"],
+            volume=geometry["volume"],
+            pbc=geometry["pbc"],
+            k_vectors=geometry["k_vectors"],
+            k_norm2=geometry["k_norm2"],
+            k_vector_batch=geometry["k_vector_batch"],
+            k0_mask=geometry["k0_mask"],
+        ).reshape(num_graphs)
+        field_energy = net_charge.new_zeros(num_graphs)
+        if external_field is not None:
+            field = external_field.to(net_charge).reshape(num_graphs, 3)
+            charge, intrinsic = self.basis.moments(net_charge)
+            atomic_dipole = charge[:, None] * geometry["positions"] + intrinsic
+            node_energy = (atomic_dipole * field[geometry["batch"]]).sum(-1)
+            field_energy = field_energy.index_add(0, geometry["batch"], node_energy)
+        return {
+            "electrostatic_energy": coulomb + field_energy,
+            "electrostatic_contributions": {"coulomb": coulomb, "field": field_energy},
+        }
+
+    def effective_potential(self, *args, **kwargs):
+        raise NotImplementedError("Effective potential is not implemented")
 
     def forward(
         self,
         gamma,
+        gamma_spin,
         geometry,
         species,
-        gamma_spin=None,
         external_field=None,
         effective_nuclear_charges=None,
-        compute_energy=True,
-        compute_potential=False,
         return_density=False,
     ):
-        q = self.density_map(gamma)
-        c, nuclear, Z = self.nuclei(q, species, effective_nuclear_charges)
-        ng = geometry["ptr"].numel() - 1
-        if external_field is None:
-            external_field = q.new_zeros(ng, 3)
-        else:
-            external_field = external_field.to(q).reshape(ng, 3)
+        multipoles = self.multipoles(
+            gamma, gamma_spin, species, effective_nuclear_charges
+        )
+        q = multipoles["electron_alpha"] + multipoles["electron_beta"]
+        spin = multipoles["electron_alpha"] - multipoles["electron_beta"]
+        c = multipoles["net_charge"]
+        ng = geometry["volume"].numel()
         charge, intrinsic = self.basis.moments(c)
         dipole = q.new_zeros(ng, 3).index_add(
             0, geometry["batch"], charge[:, None] * geometry["positions"] + intrinsic
         )
         result = dict(
+            multipoles=multipoles,
             atomic_electron_counts=q[:, 0],
             atomic_charges=charge,
             atomic_dipoles=intrinsic,
             atomic_multipoles=c,
+            atomic_spin=spin[:, 0],
             dipole=dipole,
             total_charge=q.new_zeros(ng).index_add(0, geometry["batch"], charge),
-            effective_nuclear_charges=Z,
+            effective_nuclear_charges=c[:, 0] + q[:, 0],
             density_coefficients=c,
         )
-        if gamma_spin is not None:
-            spin = self.density_map(gamma_spin)
-            result["atomic_spin"] = spin[:, 0]
-            if return_density:
-                result["spin_coefficients"] = spin
         if return_density:
-            result.update(electron_coefficients=q, charge_coefficients=c)
-        if compute_energy or compute_potential:
-            es = self.electrostatics(
-                c, nuclear, geometry, external_field, compute_energy, compute_potential
+            result.update(
+                electron_coefficients=q, spin_coefficients=spin, charge_coefficients=c
             )
-            if compute_energy:
-                result.update(
-                    electrostatic_energy=es["energy"],
-                    electrostatic_contributions=es["contributions"],
-                )
-            if compute_potential:
-                result["effective_potential"] = self.density_map.adjoint(
-                    -es["projections"]
-                )
+        result.update(self.electrostatic_energy(c, geometry, external_field))
         return result

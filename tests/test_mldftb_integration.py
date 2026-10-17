@@ -14,7 +14,7 @@ import yaml
 
 from mace.tools import AtomicNumberTable
 from mace_scf.calculators.mldftb import MLDFTBCalculator
-from mace_scf.electrostatics import MLDFTB
+from mace_scf.electrostatics import OneShotMLUKS
 from mace_scf.utils import extended_arg_parser
 from mace_scf.utils.check_args import check_config_conflicts
 from mace_scf.utils.run_train_utils import build_model, get_param_options
@@ -44,7 +44,7 @@ def atoms(periodic=False):
 
 
 def small_model(**kwargs):
-    return MLDFTB(
+    return OneShotMLUKS(
         [1],
         [1.0],
         hidden_irreps="2x0e+2x1o",
@@ -69,8 +69,18 @@ def args_from_example(tmp_path):
     return a
 
 
-def test_factory_optimizer_wrapper(tmp_path):
+@pytest.mark.parametrize("xc_type", ["onsite", "multipole"])
+def test_factory_optimizer_wrapper(tmp_path, xc_type):
     args = args_from_example(tmp_path)
+    import ast
+
+    options = (
+        ast.literal_eval(args.mldftb_config)
+        if isinstance(args.mldftb_config, str)
+        else dict(args.mldftb_config)
+    )
+    options.update(xc_type=xc_type, xc_readout="linear", xc_channels=3)
+    args.mldftb_config = options
     model = build_model(args, AtomicNumberTable([1, 8]), np.zeros(2), None, None)
     options = get_param_options(model, args)
     optimizer = torch.optim.Adam(**options)
@@ -106,8 +116,9 @@ def test_factory_optimizer_wrapper(tmp_path):
 
 @pytest.mark.parametrize("periodic", [False, True])
 @pytest.mark.parametrize("kind", ["internal", "free"])
-def test_calculator_save_load_and_cache(tmp_path, periodic, kind):
-    model = small_model(energy_kind=kind)
+@pytest.mark.parametrize("xc_type", ["onsite", "multipole"])
+def test_calculator_save_load_and_cache(tmp_path, periodic, kind, xc_type):
+    model = small_model(energy_kind=kind, xc_type=xc_type)
     path = tmp_path / "model.model"
     torch.save(model, path)
     a = atoms(periodic)
