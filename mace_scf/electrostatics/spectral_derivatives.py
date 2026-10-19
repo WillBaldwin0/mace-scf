@@ -46,6 +46,10 @@ def _second_divided_rows(eps, mu, tau, divided, rows, saturated):
     i = rows[:, None, None]
     k = torch.arange(n, device=eps.device)[None, :, None]
     j = torch.arange(n, device=eps.device)[None, None, :]
+    return _second_divided_indices(eps, mu, tau, divided, i, k, j, saturated)
+
+
+def _second_divided_indices(eps, mu, tau, divided, i, k, j, saturated):
     lo = torch.minimum(torch.minimum(i, k), j)
     hi = torch.maximum(torch.maximum(i, k), j)
     mid = i + k + j - lo - hi
@@ -77,10 +81,24 @@ def chunk_contraction(eps, mu, tau, divided, rows, a_rows, z_rows, a, z, saturat
                  + z_rows[:, :, None] * a[None, :, :])).sum(dim=1)
 
 
-@lru_cache(maxsize=1)
-def _compiled_chunk_contraction():
+def chunk_contraction_last(eps, mu, tau, divided, rows, a_rows, z_rows, at, zt, saturated):
+    """Construct [i,j,k] coefficients directly and reduce contiguous k."""
+    indices = torch.arange(eps.numel(), device=eps.device)
+    t = _second_divided_indices(
+        eps, mu, tau, divided, rows[:, None, None],
+        indices[None, None, :], indices[None, :, None], saturated,
+    )
+    return (t * (a_rows[:, None, :] * zt[None, :, :]
+                 + z_rows[:, None, :] * at[None, :, :])).sum(dim=-1)
+
+
+@lru_cache(maxsize=2)
+def _compiled_chunk_contraction(reduction_last=False):
     # Lazy compilation; fail visibly instead of silently falling back to eager.
-    return torch.compile(chunk_contraction, fullgraph=True, dynamic=True)
+    return torch.compile(
+        chunk_contraction_last if reduction_last else chunk_contraction,
+        fullgraph=True, dynamic=True,
+    )
 
 
 def _setup(eps, f, mu, tau, count):
@@ -113,13 +131,18 @@ def second_response_contraction(
     a = a - eye * (weights * a.diagonal()).sum()
     z = z - eye * (weights * z.diagonal()).sum()
     size = len(eps) if chunk_size is None else chunk_size
+    reduction_last = compile_chunk == "last"
+    if reduction_last:
+        a, z = a.contiguous(), z.contiguous()
+        at, zt = a.T.contiguous(), z.T.contiguous()
     parts = []
     for start in range(0, len(eps), size):
         stop = min(start + size, len(eps))
         if compile_chunk:
             rows = torch.arange(start, stop, device=eps.device)
-            parts.append(_compiled_chunk_contraction()(
-                eps, mu, tau, divided, rows, a[start:stop], z[start:stop], a, z, saturated
+            parts.append(_compiled_chunk_contraction(reduction_last)(
+                eps, mu, tau, divided, rows, a[start:stop], z[start:stop],
+                at if reduction_last else a, zt if reduction_last else z, saturated
             ))
             continue
         t = second_divided(eps, mu, tau, divided, start, stop, saturated)
