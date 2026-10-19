@@ -63,6 +63,8 @@ class _OneShotMLBase(_LocalSourceModelBase):
         matrix_sh_max_l=1,
         dos_grid=None,
         dos_width=0.2,
+        higher_order_backend="smooth",
+        spectral_chunk_size=None,
         matrix_radial_hidden=32,
         elec_temp_units="kelvin",
         default_elec_temp=0.25,
@@ -91,7 +93,9 @@ class _OneShotMLBase(_LocalSourceModelBase):
             raise ValueError("At least one interaction is required")
         if effective_nuclear_charges is None:
             if nuclear_charge_mode == "per_species":
-                raise ValueError("Specify effective_nuclear_charges for per_species mode")
+                raise ValueError(
+                    "Specify effective_nuclear_charges for per_species mode"
+                )
             effective_nuclear_charges = [0.0] * len(atomic_numbers)
         if len(effective_nuclear_charges) != len(atomic_numbers):
             raise ValueError("Supply one effective nuclear charge per species")
@@ -142,7 +146,9 @@ class _OneShotMLBase(_LocalSourceModelBase):
             )
         if not math.isfinite(default_elec_temp) or default_elec_temp < 0:
             raise ValueError("default_elec_temp must be finite and nonnegative (eV)")
-        self.register_buffer("default_elec_temp", torch.tensor(float(default_elec_temp)))
+        self.register_buffer(
+            "default_elec_temp", torch.tensor(float(default_elec_temp))
+        )
         self.elec_temp_units = elec_temp_units
         self.electronic_state = ElectronicState(
             n_s + 3 * n_p,
@@ -150,6 +156,8 @@ class _OneShotMLBase(_LocalSourceModelBase):
             elec_temp_units,
             dos_grid=dos_grid,
             dos_width=dos_width,
+            higher_order_backend=higher_order_backend,
+            spectral_chunk_size=spectral_chunk_size,
         )
         if not math.isfinite(kspace_cutoff_factor) or kspace_cutoff_factor <= 0:
             raise ValueError("kspace_cutoff_factor must be positive and finite")
@@ -282,17 +290,36 @@ class _OneShotMLBase(_LocalSourceModelBase):
 
         alpha, beta = graph_field("N_alpha"), graph_field("N_beta")
         charge = graph_field("total_charge")
-        if not torch.isfinite(charge).all() or not data.get("total_charge_present", torch.ones(ng, dtype=torch.bool, device=x.device)).all():
+        if (
+            not torch.isfinite(charge).all()
+            or not data.get(
+                "total_charge_present",
+                torch.ones(ng, dtype=torch.bool, device=x.device),
+            ).all()
+        ):
             raise ValueError("total_charge must be explicitly supplied and finite")
         capacity = (ptr[1:] - ptr[:-1]) * self.electronic_state.block_size
-        if not (torch.isfinite(alpha).all() and torch.isfinite(beta).all()) or ((alpha < 0) | (beta < 0) | (alpha > capacity) | (beta > capacity) | (alpha + beta > capacity)).any():
-            raise ValueError("Electron counts must be nonnegative and N_alpha + N_beta <= basis size")
+        if (
+            not (torch.isfinite(alpha).all() and torch.isfinite(beta).all())
+            or (
+                (alpha < 0)
+                | (beta < 0)
+                | (alpha > capacity)
+                | (beta > capacity)
+                | (alpha + beta > capacity)
+            ).any()
+        ):
+            raise ValueError(
+                "Electron counts must be nonnegative and N_alpha + N_beta <= basis size"
+            )
         default_temperature = self.default_elec_temp.to(x).expand(ng)
         if self.elec_temp_units == "kelvin":
             default_temperature = default_temperature / 8.617333262145e-5
         temperature = graph_field("elec_temp", default_temperature)
         if "elec_temp_present" in data:
-            temperature = torch.where(data["elec_temp_present"].reshape(-1), temperature, default_temperature)
+            temperature = torch.where(
+                data["elec_temp_present"].reshape(-1), temperature, default_temperature
+            )
         node_heads = data.get(
             "head", torch.zeros(ng, dtype=torch.long, device=x.device)
         ).reshape(-1)[batch]

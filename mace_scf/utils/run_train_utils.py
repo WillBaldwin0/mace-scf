@@ -211,7 +211,7 @@ def build_model(
         if missing:
             raise ValueError(f"Missing effective nuclear charges for atomic numbers {sorted(missing)}")
         allowed = {"hamiltonian_cutoff", "n_s", "n_p", "edge_mode", "matrix_sh_max_l", "dos_grid", "dos_width", "matrix_feature_multiplicity",
-                   "matrix_radial_hidden", "default_elec_temp", "elec_temp_units", "energy_kind", "sigma",
+                   "higher_order_backend", "spectral_chunk_size", "matrix_radial_hidden", "default_elec_temp", "elec_temp_units", "energy_kind", "sigma",
                    "xc_type", "xc_readout", "xc_channels", "xc_hidden", "xc_norm_epsilon",
                    "pp_scalar", "keep_quadrupoles", "coupling_mode", "C", "nuclear_profile",
                    "nuclear_charge_mode", "self_policy", "pbc_handling", "kspace_cutoff_factor"}

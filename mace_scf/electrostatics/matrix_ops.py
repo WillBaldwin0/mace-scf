@@ -749,12 +749,24 @@ class _CanonicalState(torch.autograd.Function):
     """One spin channel with an explicit derivative-order contract."""
 
     @staticmethod
-    def forward(ctx, H, count, tau, tolerance, derivative_mode):
+    def forward(
+        ctx,
+        H,
+        count,
+        tau,
+        tolerance,
+        derivative_mode,
+        higher_order_backend="smooth",
+        spectral_chunk_size=None,
+    ):
         eps, U = torch.linalg.eigh(H)
         f, mu, entropy = _occupations_and_entropy(eps, count, tau, tolerance)
         P = (U * f) @ U.T
         free = (f * eps).sum() + tau * entropy
         ctx.save_for_backward(H, count, tau, eps, U, f, mu, P)
+        ctx.higher_order_backend = higher_order_backend
+        ctx.spectral_chunk_size = spectral_chunk_size
+        ctx.input_count = len(ctx.needs_input_grad)
         ctx.tolerance, ctx.derivative_mode = tolerance, derivative_mode
         ctx.mark_non_differentiable(eps, mu, U)
         ctx.set_materialize_grads(False)
@@ -770,6 +782,25 @@ class _CanonicalState(torch.autograd.Function):
                 )
             if grad_f is not None:
                 raise RuntimeError("Occupation outputs support first derivatives only")
+            if ctx.higher_order_backend == "spectral":
+                from .spectral_derivatives import SpectralBackward
+
+                A = torch.zeros_like(H) if grad_P is None else grad_P
+                c = H.new_zeros(()) if grad_free is None else grad_free
+                response = SpectralBackward.apply(
+                    H,
+                    A,
+                    c,
+                    eps.detach(),
+                    U.detach(),
+                    f.detach(),
+                    mu.detach(),
+                    saved_P.detach(),
+                    tau,
+                    count,
+                    ctx.spectral_chunk_size,
+                )
+                return (response,) + (None,) * (ctx.input_count - 1)
             P, _ = _smooth_density(H, count, tau, eps, mu, f)
             response = (
                 H * 0
@@ -789,7 +820,7 @@ class _CanonicalState(torch.autograd.Function):
                 response = response + _occupation_response(U, f, tau, grad_f)
         if grad_free is not None:
             response = response + grad_free * P
-        return response, None, None, None, None
+        return (response,) + (None,) * (ctx.input_count - 1)
 
 
 class _GaussianDOS(torch.autograd.Function):
@@ -840,6 +871,8 @@ class ElectronicState(nn.Module):
         dos_grid=None,
         dos_width=0.2,
         degeneracy_tolerance=1e-9,
+        higher_order_backend="smooth",
+        spectral_chunk_size=None,
     ):
         super().__init__()
         if spin_mode not in {"RKS", "UKS"}:
@@ -871,6 +904,14 @@ class ElectronicState(nn.Module):
             raise ValueError("dos_width must be positive and finite")
         self.register_buffer("dos_grid", grid.clone())
         self.register_buffer("dos_width", width.clone())
+        if higher_order_backend not in {"smooth", "spectral"}:
+            raise ValueError("higher_order_backend must be smooth or spectral")
+        if spectral_chunk_size is not None and (
+            not isinstance(spectral_chunk_size, int) or spectral_chunk_size < 1
+        ):
+            raise ValueError("spectral_chunk_size must be a positive integer or None")
+        self.higher_order_backend = higher_order_backend
+        self.spectral_chunk_size = spectral_chunk_size
         self.block_size, self.spin_mode = block_size, spin_mode
         self.elec_temp_units, self.degeneracy_tolerance = (
             elec_temp_units,
@@ -904,7 +945,13 @@ class ElectronicState(nn.Module):
                 )
         else:
             P, free, eps, f, mu, U = _CanonicalState.apply(
-                H, count, tau, self.degeneracy_tolerance, mode
+                H,
+                count,
+                tau,
+                self.degeneracy_tolerance,
+                mode,
+                getattr(self, "higher_order_backend", "smooth"),
+                getattr(self, "spectral_chunk_size", None),
             )
             dos, cumulative = _GaussianDOS.apply(
                 H, eps, U, self.dos_grid, self.dos_width
