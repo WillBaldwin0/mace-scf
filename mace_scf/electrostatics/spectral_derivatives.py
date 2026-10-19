@@ -4,6 +4,8 @@ No eigenvector derivatives or matrix-function reconstruction. Cubic intermediate
 are permitted; optional row tiling bounds storage without changing the formula.
 """
 
+from functools import lru_cache
+
 import torch
 
 
@@ -35,10 +37,13 @@ def first_divided(eps, f, mu, tau, saturated=False):
 
 def second_divided(eps, mu, tau, divided, start=0, stop=None, saturated=False):
     """Coefficients [i,k,j], sorting arguments to divide by the largest gap."""
+    rows = torch.arange(start, eps.numel() if stop is None else stop, device=eps.device)
+    return _second_divided_rows(eps, mu, tau, divided, rows, saturated)
+
+
+def _second_divided_rows(eps, mu, tau, divided, rows, saturated):
     n = eps.numel()
-    i = torch.arange(start, n if stop is None else stop, device=eps.device)[
-        :, None, None
-    ]
+    i = rows[:, None, None]
     k = torch.arange(n, device=eps.device)[None, :, None]
     j = torch.arange(n, device=eps.device)[None, None, :]
     lo = torch.minimum(torch.minimum(i, k), j)
@@ -65,6 +70,19 @@ def second_divided(eps, mu, tau, divided, start=0, stop=None, saturated=False):
     return torch.where(near, local, quotient)
 
 
+def chunk_contraction(eps, mu, tau, divided, rows, a_rows, z_rows, a, z, saturated):
+    """Evaluate and reduce one row tile; rows is a tensor to avoid offset guards."""
+    t = _second_divided_rows(eps, mu, tau, divided, rows, saturated)
+    return (t * (a_rows[:, :, None] * z[None, :, :]
+                 + z_rows[:, :, None] * a[None, :, :])).sum(dim=1)
+
+
+@lru_cache(maxsize=1)
+def _compiled_chunk_contraction():
+    # Lazy compilation; fail visibly instead of silently falling back to eager.
+    return torch.compile(chunk_contraction, fullgraph=True, dynamic=True)
+
+
 def _setup(eps, f, mu, tau, count):
     saturated = (
         float(count).is_integer()
@@ -86,7 +104,7 @@ def response(U, divided, fp, weights, A):
 
 
 def second_response_contraction(
-    U, eps, mu, tau, divided, fp, weights, A, Z, saturated=False, chunk_size=None
+    U, eps, mu, tau, divided, fp, weights, A, Z, saturated=False, chunk_size=None, compile_chunk=False
 ):
     """Return C with C:E = A:D²P[E,Z], at fixed population."""
     a = U.T @ ((A + A.T) / 2) @ U
@@ -98,6 +116,12 @@ def second_response_contraction(
     parts = []
     for start in range(0, len(eps), size):
         stop = min(start + size, len(eps))
+        if compile_chunk:
+            rows = torch.arange(start, stop, device=eps.device)
+            parts.append(_compiled_chunk_contraction()(
+                eps, mu, tau, divided, rows, a[start:stop], z[start:stop], a, z, saturated
+            ))
+            continue
         t = second_divided(eps, mu, tau, divided, start, stop, saturated)
         parts.append(
             torch.einsum("ikj,ik,kj->ij", t, a[start:stop], z)
@@ -113,10 +137,12 @@ class SpectralBackward(torch.autograd.Function):
     """Combined density/free-energy VJP with an explicit second derivative."""
 
     @staticmethod
-    def forward(ctx, H, A, c, eps, U, f, mu, P, tau, count, chunk_size):
+    def forward(ctx, H, A, c, eps, U, f, mu, P, tau, count, chunk_size, compile_chunk=False):
         divided, fp, weights, saturated = _setup(eps, f, mu, tau, count)
         ctx.save_for_backward(A, c, eps, U, f, mu, P, tau, count)
         ctx.chunk_size = chunk_size
+        ctx.compile_chunk = compile_chunk
+        ctx.input_count = len(ctx.needs_input_grad)
         return response(U, divided, fp, weights, A) + c * P
 
     @staticmethod
@@ -131,11 +157,11 @@ class SpectralBackward(torch.autograd.Function):
                 torch.zeros_like(A),
                 torch.zeros_like(A),
                 (Z * P).sum().reshape_as(c),
-                *([None] * 8),
+                *([None] * (ctx.input_count - 3)),
             )
         divided, fp, weights, saturated = _setup(eps, f, mu, tau, count)
         R = response(U, divided, fp, weights, Z)
         C = second_response_contraction(
-            U, eps, mu, tau, divided, fp, weights, A, Z, saturated, ctx.chunk_size
+            U, eps, mu, tau, divided, fp, weights, A, Z, saturated, ctx.chunk_size, ctx.compile_chunk
         )
-        return C + c * R, R, (Z * P).sum().reshape_as(c), *([None] * 8)
+        return C + c * R, R, (Z * P).sum().reshape_as(c), *([None] * (ctx.input_count - 3))

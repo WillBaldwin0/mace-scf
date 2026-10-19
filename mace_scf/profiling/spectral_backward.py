@@ -19,14 +19,14 @@ def objective(H, count, tau, backend, A, chunk=None):
     return (P * A).sum() + 0.1 * P.square().sum() + 0.01 * free.square()
 
 
-def matrix_check(H, count, tau, chunk=None):
+def matrix_check(H, count, tau, chunk=None, backend="spectral"):
     H = H.detach().requires_grad_()
     A = torch.randn_like(H)
     Z = torch.randn_like(H)
     Z = (Z + Z.T) / 2
     Z = Z / Z.norm()
     values = []
-    for backend in ("smooth", "spectral"):
+    for backend in ("smooth", backend):
         loss = objective(H, count, tau, backend, A, chunk)
         g = torch.autograd.grad(loss, H, create_graph=True)[0]
         h = torch.autograd.grad((g * Z).sum(), H)[0]
@@ -53,7 +53,7 @@ def matrix_check(H, count, tau, chunk=None):
 
 
 def wrapper_check(
-    device="cpu", spin="RKS", periodic=False, batch_size=1, chunk=None, force_only=False
+    device="cpu", spin="RKS", periodic=False, batch_size=1, chunk=None, force_only=False, backend="spectral"
 ):
     """Force-loss parameter directional FD through the actual training wrapper."""
     from ase import Atoms
@@ -127,7 +127,7 @@ def wrapper_check(
 
     derivatives = []
     gradients = []
-    for backend in ("smooth", "spectral"):
+    for backend in ("smooth", backend):
         model.electronic_state.higher_order_backend = backend
         optimizer.zero_grad(set_to_none=True)
         loss(True).backward()

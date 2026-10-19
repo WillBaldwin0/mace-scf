@@ -782,7 +782,7 @@ class _CanonicalState(torch.autograd.Function):
                 )
             if grad_f is not None:
                 raise RuntimeError("Occupation outputs support first derivatives only")
-            if ctx.higher_order_backend == "spectral":
+            if ctx.higher_order_backend in {"spectral", "spectral_compiled"}:
                 from .spectral_derivatives import SpectralBackward
 
                 A = torch.zeros_like(H) if grad_P is None else grad_P
@@ -799,6 +799,7 @@ class _CanonicalState(torch.autograd.Function):
                     tau,
                     count,
                     ctx.spectral_chunk_size,
+                    ctx.higher_order_backend == "spectral_compiled",
                 )
                 return (response,) + (None,) * (ctx.input_count - 1)
             P, _ = _smooth_density(H, count, tau, eps, mu, f)
@@ -904,8 +905,8 @@ class ElectronicState(nn.Module):
             raise ValueError("dos_width must be positive and finite")
         self.register_buffer("dos_grid", grid.clone())
         self.register_buffer("dos_width", width.clone())
-        if higher_order_backend not in {"smooth", "spectral"}:
-            raise ValueError("higher_order_backend must be smooth or spectral")
+        if higher_order_backend not in {"smooth", "spectral", "spectral_compiled"}:
+            raise ValueError("higher_order_backend must be smooth, spectral or spectral_compiled")
         if spectral_chunk_size is not None and (
             not isinstance(spectral_chunk_size, int) or spectral_chunk_size < 1
         ):
