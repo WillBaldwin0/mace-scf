@@ -642,13 +642,10 @@ def _fill(eps, count, tau, degeneracy_tolerance=1e-9):
     # Bisection is only a root finder. Newton corrections restore implicit
     # derivatives of the fixed-count root, including those needed by force loss.
     with torch.no_grad():
-        lo, hi = eps.min() - 80 * tau, eps.max() + 80 * tau
-        for _ in range(80):
-            mu = (lo + hi) / 2
-            below = torch.sigmoid((mu - eps) / tau).sum() < count
-            lo = torch.where(below, mu, lo)
-            hi = torch.where(below, hi, mu)
-        mu = (lo + hi) / 2
+        from .occupation_root import bisect_chemical_potential, compiled_bisection
+
+        root = compiled_bisection() if eps.is_cuda else bisect_chemical_potential
+        mu = root(eps, count, tau)
     for _ in range(3):
         f = torch.sigmoid((mu - eps) / tau)
         slope = (f * (1 - f)).sum() / tau
