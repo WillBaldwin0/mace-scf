@@ -464,6 +464,7 @@ def evaluate(
     delta_mus_per_atom_list = []
     mus_list = []
     dmas_computed = False
+    delta_spin_list = []
     delta_dmas_list = []
     dmas_list = []
     delta_esps_list = []
@@ -540,6 +541,12 @@ def evaluate(
         if output.get("fermi_level") is not None and batch.fermi_level is not None:
             fermi_level_computed = True
             delta_fermi_level_list.append(batch.fermi_level - output["fermi_level"])
+        if output.get("atomic_spin") is not None and batch.get("atomic_spin") is not None:
+            labelled_spin = batch.atomic_spin_weight.reshape(-1)[batch.batch] > 0
+            if bool(labelled_spin.any()):
+                delta_spin_list.append(
+                    (batch.atomic_spin - output["atomic_spin"])[labelled_spin].detach()
+                )
         if output.get("dipole") is not None and batch.dipole is not None:
             dipole_components_to_include = batch.dipole_weight.view(-1, 3) > 0.0
             if torch.any(dipole_components_to_include):
@@ -640,6 +647,11 @@ def evaluate(
         aux["rmse_mu_per_atom"] = compute_rmse(delta_mus_per_atom)
         aux["rel_rmse_mu"] = compute_rel_rmse(delta_mus, mus)
         aux["q95_mu"] = compute_q95(delta_mus)
+    if delta_spin_list:
+        delta_spin = to_numpy(torch.cat(delta_spin_list))
+        aux["mae_atomic_spin"] = compute_mae(delta_spin)
+        aux["rmse_atomic_spin"] = compute_rmse(delta_spin)
+        logging.info("Atomic spin: MAE %.6g, RMSE %.6g", aux["mae_atomic_spin"], aux["rmse_atomic_spin"])
     if dmas_computed:
         delta_dmas = to_numpy(torch.cat(delta_dmas_list, dim=0))
         dmas = to_numpy(torch.cat(dmas_list, dim=0))

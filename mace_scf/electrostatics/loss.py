@@ -50,6 +50,15 @@ def weighted_mean_squared_error_fermi_extensive(ref: Batch, pred: TensorDict) ->
     return torch.mean(configs_weight * torch.square( (ref["fermi_level"] - pred['fermi_level']) ))
 
 
+def weighted_mean_squared_error_atomic_spin(ref: Batch, pred: TensorDict) -> torch.Tensor:
+    target, prediction = ref["atomic_spin"], pred["atomic_spin"]
+    if target.shape != prediction.shape:
+        raise ValueError("atomic_spin reference and prediction shapes must match")
+    weights = ref.weight.reshape(-1)[ref.batch] * ref.atomic_spin_weight.reshape(-1)[ref.batch]
+    error = torch.where(weights > 0, prediction - target, torch.zeros_like(prediction))
+    return (weights * error.square()).mean()
+
+
 def weighted_mean_squared_error_dma(ref: Batch, pred: TensorDict) -> torch.Tensor:
     # dma: [n_atoms, many]
     configs_weight = torch.repeat_interleave(
@@ -243,6 +252,7 @@ class FixedPointStability(torch.nn.Module):
 
 
 _LOSS_FUNCTIONS = {
+    "atomic_spin": weighted_mean_squared_error_atomic_spin,
     "energy_per_atom": weighted_mean_squared_error_energy,
     "forces": mean_squared_error_forces,
     "stress": weighted_mean_squared_stress,

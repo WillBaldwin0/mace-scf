@@ -77,6 +77,8 @@ class ExtAtomicData(AtomicData):
             key: kwargs.pop(key, None)
             for key in ("N_alpha", "N_beta", "effective_nuclear_charges", "elec_temp_present", "total_charge_present")
         }
+        atomic_spin = kwargs.pop("atomic_spin", None)
+        atomic_spin_weight = kwargs.pop("atomic_spin_weight", None)
         # new bits
         density_coefficients = kwargs.pop("density_coefficients", None)
         density_coefficients_weight = kwargs.pop(
@@ -121,6 +123,8 @@ class ExtAtomicData(AtomicData):
 
         # Aggregate data
         data = {
+            "atomic_spin": atomic_spin,
+            "atomic_spin_weight": atomic_spin_weight,
             "density_coefficients": density_coefficients,
             "density_coefficients_weight": density_coefficients_weight,
             "electrostatic_potentials": electrostatic_potentials,
@@ -173,6 +177,19 @@ class ExtAtomicData(AtomicData):
             ).view(3, 3)
         )
         atomic_data.cell = cell
+
+        spin_values = config.properties.get("atomic_spin")
+        atomic_spin = torch.as_tensor(
+            np.zeros(num_atoms) if spin_values is None else spin_values,
+            dtype=torch.get_default_dtype(),
+        ).reshape(-1)
+        if atomic_spin.shape != (num_atoms,):
+            raise ValueError("atomic_spin must contain one scalar per atom")
+        spin_weight = config.property_weights.get("atomic_spin")
+        atomic_spin_weight = torch.tensor(
+            0.0 if spin_values is None else (1.0 if spin_weight is None else spin_weight),
+            dtype=torch.get_default_dtype(),
+        )
 
         density_coefficients = (
             torch.tensor(
@@ -327,6 +344,8 @@ class ExtAtomicData(AtomicData):
                 for key in ("N_alpha", "N_beta", "effective_nuclear_charges")
                 if config.properties.get(key) is not None
             },
+            atomic_spin=atomic_spin,
+            atomic_spin_weight=atomic_spin_weight,
             density_coefficients=density_coefficients,
             density_coefficients_weight=density_coefficients_weight,
             electrostatic_potentials=electrostatic_potentials,
