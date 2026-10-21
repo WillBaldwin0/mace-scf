@@ -541,7 +541,7 @@ def evaluate(
         if output.get("fermi_level") is not None and batch.fermi_level is not None:
             fermi_level_computed = True
             delta_fermi_level_list.append(batch.fermi_level - output["fermi_level"])
-        if output.get("atomic_spin") is not None and batch.get("atomic_spin") is not None:
+        if output.get("atomic_spin") is not None and getattr(batch, "atomic_spin", None) is not None:
             labelled_spin = batch.atomic_spin_weight.reshape(-1)[batch.batch] > 0
             if bool(labelled_spin.any()):
                 delta_spin_list.append(
