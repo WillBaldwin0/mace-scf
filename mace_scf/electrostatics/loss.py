@@ -11,6 +11,7 @@ from mace.modules.loss import (
     weighted_mean_squared_stress,
 )
 from .utils import compute_effective_index
+from .dos_loss import DOSLoss
 import logging
 
 
@@ -252,6 +253,7 @@ class FixedPointStability(torch.nn.Module):
 
 
 _LOSS_FUNCTIONS = {
+    "dos": DOSLoss,
     "atomic_spin": weighted_mean_squared_error_atomic_spin,
     "energy_per_atom": weighted_mean_squared_error_energy,
     "forces": mean_squared_error_forces,
@@ -288,7 +290,7 @@ class WeightedLoss(torch.nn.Module):
             if not name in _LOSS_FUNCTIONS:
                 raise ValueError(f"requested `{name}` in loss, which is not recognised")
             self.loss_weights[name] = options["weight"]
-            if len(options) > 1:
+            if len(options) > 1 or isinstance(_LOSS_FUNCTIONS[name], type):
                 options.pop("weight")
                 self.loss_fns[name] = _LOSS_FUNCTIONS[name](**options)
             else:
@@ -314,4 +316,6 @@ class WeightedLoss(torch.nn.Module):
         string = f"{self.__class__.__name__}("
         for name in self.loss_fns:
             string += f"{name}_weight={self.loss_weights[name]}, "
+            if name == "dos":
+                string += f"{self.loss_fns[name]}, "
         return string + ")"

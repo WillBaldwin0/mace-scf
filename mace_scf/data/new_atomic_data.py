@@ -34,6 +34,9 @@ def update_keyspec_from_kwargs(keyspec, keydict) -> KeySpecification:
         "N_beta_key",
         "elec_temp_key",
         "total_charge_key",
+        "dos_key",
+        "dos_chemical_potential_key",
+        "dos_elec_temp_key",
     ]
     arrays = [
         "forces_key",
@@ -77,6 +80,9 @@ class ExtAtomicData(AtomicData):
             key: kwargs.pop(key, None)
             for key in ("N_alpha", "N_beta", "effective_nuclear_charges", "elec_temp_present", "total_charge_present")
         }
+        dos_fields = {key: kwargs.pop(key, None) for key in (
+            "dos_samples", "dos_num_points", "dos_chemical_potential", "dos_elec_temp", "dos_weight"
+        )}
         atomic_spin = kwargs.pop("atomic_spin", None)
         atomic_spin_weight = kwargs.pop("atomic_spin_weight", None)
         # new bits
@@ -143,6 +149,7 @@ class ExtAtomicData(AtomicData):
             "enegs": enegs,
             "hardness": hardness,
         }
+        data.update(dos_fields)
         data.update(electronic)
         for key, value in data.items():
             setattr(self, key, value)
@@ -177,6 +184,33 @@ class ExtAtomicData(AtomicData):
             ).view(3, 3)
         )
         atomic_data.cell = cell
+
+        dos = config.properties.get("dos")
+        if dos is None:
+            dos_samples = torch.empty((0, 2), dtype=torch.get_default_dtype())
+            dos_mu, dos_tau, dos_weight = 0.0, 0.0, 0.0
+        else:
+            dos_samples = torch.as_tensor(np.asarray(dos), dtype=torch.get_default_dtype())
+            if (dos_samples.ndim != 2 or dos_samples.shape[1] != 2
+                    or dos_samples.shape[0] < 2 or not torch.isfinite(dos_samples).all()
+                    or not (dos_samples[1:, 0] > dos_samples[:-1, 0]).all()
+                    or (dos_samples[:, 1] < 0).any()):
+                raise ValueError("dos must be a finite [points, 2] energy/DOS array with increasing energies and nonnegative DOS")
+            if any(config.properties.get(k) is None for k in ("dos_chemical_potential", "dos_elec_temp")):
+                raise ValueError("DOS labels require dos_chemical_potential and dos_elec_temp (eV)")
+            dos_mu = float(config.properties["dos_chemical_potential"])
+            dos_tau = float(config.properties["dos_elec_temp"])
+            if not np.isfinite([dos_mu, dos_tau]).all() or dos_tau < 0:
+                raise ValueError("Invalid DOS reference chemical potential or temperature")
+            dos_weight = config.property_weights.get("dos")
+            dos_weight = 1.0 if dos_weight is None else float(dos_weight)
+        dos_fields = dict(
+            dos_samples=dos_samples,
+            dos_num_points=torch.tensor([len(dos_samples)], dtype=torch.long),
+            dos_chemical_potential=torch.tensor(dos_mu, dtype=torch.get_default_dtype()),
+            dos_elec_temp=torch.tensor(dos_tau, dtype=torch.get_default_dtype()),
+            dos_weight=torch.tensor(dos_weight, dtype=torch.get_default_dtype()),
+        )
 
         spin_values = config.properties.get("atomic_spin")
         atomic_spin = torch.as_tensor(
@@ -344,6 +378,7 @@ class ExtAtomicData(AtomicData):
                 for key in ("N_alpha", "N_beta", "effective_nuclear_charges")
                 if config.properties.get(key) is not None
             },
+            **dos_fields,
             atomic_spin=atomic_spin,
             atomic_spin_weight=atomic_spin_weight,
             density_coefficients=density_coefficients,

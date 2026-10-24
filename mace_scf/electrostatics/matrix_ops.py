@@ -822,6 +822,36 @@ class _CanonicalState(torch.autograd.Function):
         return (response,) + (None,) * (ctx.input_count - 1)
 
 
+class SpectralLossState(torch.autograd.Function):
+    """Private spectral coordinates for smooth permutation-invariant losses.
+
+    Never differentiate eigenvectors. Equal spectral weights at degeneracies
+    give a basis-independent projector sum. Not a general eigenvector API.
+    """
+    @staticmethod
+    def forward(ctx, H, eps, U, occupations, tau, count):
+        ctx.save_for_backward(U, occupations, tau, count)
+        ctx.set_materialize_grads(False)
+        return eps.clone(), occupations.clone()
+
+    @staticmethod
+    def backward(ctx, ge, gf):
+        if torch.is_grad_enabled():
+            raise RuntimeError("DOS loss supports first parameter derivatives only")
+        U, f, tau, count = ctx.saved_tensors
+        g = torch.zeros_like(f) if ge is None else ge
+        if gf is not None:
+            p = f * (1 - f)
+            saturated = float(count).is_integer() and float(p.sum()) <= 8 * torch.finfo(f.dtype).eps
+            if float(tau) > 0 and not saturated:
+                fp = -p / tau
+                g = g + fp * (gf - (fp * gf).sum() / fp.sum())
+            elif float(tau) == 0 and bool(((f > 0) & (f < 1)).any()):
+                raise ValueError("Occupied DOS derivatives need positive smearing at a partially filled level")
+        response = (U * g) @ U.T
+        return (response + response.T) / 2, None, None, None, None, None
+
+
 class _GaussianDOS(torch.autograd.Function):
     """First-order smooth spectral observables, sharing an existing eigensolve."""
 
@@ -922,7 +952,7 @@ class ElectronicState(nn.Module):
             8.617333262145e-5 if self.elec_temp_units == "kelvin" else 1.0
         )
 
-    def _channel(self, H, count, tau, mode, full, eigenvectors):
+    def _channel(self, H, count, tau, mode, full, eigenvectors, loss_spectrum=False):
         if (
             H.ndim != 2
             or H.shape[0] != H.shape[1]
@@ -968,6 +998,14 @@ class ElectronicState(nn.Module):
             chemical_potential=mu,
             count_residual=f.detach().sum() - count,
         )
+        if loss_spectrum:
+            loss_eps, loss_f = SpectralLossState.apply(
+                H.detach() if mode == "none" else H,
+                eps.detach(), U.detach(), f.detach(), tau, count,
+            )
+            diagnostic["loss_spectrum"] = dict(
+                energies=loss_eps, occupations=loss_f, chemical_potential=mu.detach(),
+            )
         if full:
             diagnostic["density"] = P
         if eigenvectors:
@@ -984,6 +1022,7 @@ class ElectronicState(nn.Module):
         derivative_mode,
         return_full_density=False,
         return_eigenvectors=False,
+        return_dos_state=False,
     ):
         if derivative_mode not in {"none", "first_order", "second_order"}:
             raise ValueError("Unknown derivative_mode")
@@ -1037,6 +1076,7 @@ class ElectronicState(nn.Module):
                     derivative_mode,
                     return_full_density,
                     return_eigenvectors,
+                    return_dos_state,
                 )
                 for s, H in enumerate(matrices)
             ]

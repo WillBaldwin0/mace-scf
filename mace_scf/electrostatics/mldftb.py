@@ -370,6 +370,7 @@ class _OneShotMLBase(_LocalSourceModelBase):
             derivative_mode=mode,
             return_full_density=return_electronic_state,
             return_eigenvectors=return_electronic_state,
+            return_dos_state=("dos_samples" in data and data["dos_samples"].numel() > 0),
         )
         result = self.density_electrostatics(
             state["gamma"],
@@ -427,6 +428,11 @@ class _OneShotMLBase(_LocalSourceModelBase):
             virials=None,
             stress=None,
         )
+        if "dos_samples" in data and data["dos_samples"].numel() > 0:
+            result["dos_state"] = [
+                tuple(c["loss_spectrum"] for c in channels)
+                for channels in state["spectral_states"]
+            ]
         targets = ([positions] if compute_force else []) + (
             [displacement] if compute_virials or compute_stress else []
         )

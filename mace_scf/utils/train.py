@@ -464,6 +464,7 @@ def evaluate(
     delta_mus_per_atom_list = []
     mus_list = []
     dmas_computed = False
+    dos_diagnostics = []
     delta_spin_list = []
     delta_dmas_list = []
     dmas_list = []
@@ -505,6 +506,9 @@ def evaluate(
         output = _detach_to_cpu(output)
 
         loss = loss_fn(pred=output, ref=batch)
+        dos_term = getattr(loss_fn, "loss_fns", {}).get("dos")
+        if dos_term is not None:
+            dos_diagnostics.extend(dos_term.last_diagnostics)
         total_loss += to_numpy(loss).item()
         num_configs += batch.num_graphs
 
@@ -601,6 +605,12 @@ def evaluate(
         "loss": avg_loss,
     }
 
+    if dos_diagnostics:
+        aux["dos_mse"] = float(np.mean([d["mse"] for d in dos_diagnostics]))
+        aux["dos_alignment_shift_mean"] = float(np.mean([d["relative_shift"] for d in dos_diagnostics]))
+        aux["dos_alignment_curvature_min"] = min(d["curvature"] for d in dos_diagnostics)
+        logging.info("DOS MSE %.6g, mean alignment shift %.6g eV, minimum curvature %.6g",
+                     aux["dos_mse"], aux["dos_alignment_shift_mean"], aux["dos_alignment_curvature_min"])
     if E_computed:
         delta_es = to_numpy(torch.cat(delta_es_list, dim=0))
         delta_es_per_atom = to_numpy(torch.cat(delta_es_per_atom_list, dim=0))
